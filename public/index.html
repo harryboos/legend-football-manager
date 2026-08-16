@@ -1,0 +1,6 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>传奇足球经理</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/tactics.css"><link rel="stylesheet" href="/onboarding.css"><link rel="stylesheet" href="/draft.css"><link rel="stylesheet" href="/player-profile.css"></head>
+<body><header><div><b>⚽ 传奇足球经理</b><span>20 队 · 双阶段职责 · 38 轮联赛</span></div><div id="roomBadge"></div></header>
+<main>
+ <section id="welcome" class="hero"><div><small>多人网页足球经理 MVP</small><h1>组建你的传奇之师，<br>赢下整个赛季。</h1><p>邀请伙伴加入同一房间，其余球队交给 AI。选择球队、完成选秀、排兵布阵，然后见证 38 轮冠军之路。</p></div><div class="card form"><h2>开始游戏</h2><label>联赛名称<input id="leagueName" value="周末传奇联赛"></label><label>你的经理名<input id="managerName" value="主教练"></label><label>你的开局球队<select id="hostTeam"></select></label><button onclick="createGame()">创建新房间</button><div class="or">或加入已有房间</div><label>房间码<input id="roomCode" maxlength="6" placeholder="例如 ABC123"></label><button class="secondary" onclick="joinGame()">查看可选球队</button></div></section>
+ <section id="app" class="hidden"><nav id="tabs"></nav><div id="view"></div></section>
+</main><div id="modal" class="hidden"></div><div id="toast"></div><script src="/app.js"></script></body></html>

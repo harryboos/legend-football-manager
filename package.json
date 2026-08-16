@@ -1,0 +1,12 @@
+{
+  "name": "legend-football-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "20队多人足球经理网页游戏 MVP",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" }
+}
