@@ -1,14 +1,52 @@
 const {PLAYERS, positionFit, roleScore} = require('./players');
 const {CUSTOM_FORMATION, formationSlots, normalizeCustomFormation, rulesFor} = require('./rules');
+const {profileForTeam, roleBias} = require('./ai-manager');
 
-function defaultAssignment(game, slot, playerId) {
+function bestRole(player, roles, group, profile, phase) {
+  return roles
+    .map(role => ({role, score: roleScore(player, role, group) + roleBias(profile, role, phase)}))
+    .sort((left, right) => right.score - left.score || left.role.localeCompare(right.role, 'zh-CN'))[0];
+}
+
+function lineupOption(game, player, slot, profile) {
   const rules = rulesFor(game);
+  const inRole = bestRole(player, rules.inRoles[slot.group], slot.group, profile, 'in');
+  const outRole = bestRole(player, rules.outRoles[slot.group], slot.group, profile, 'out');
+  const fit = positionFit(player, slot);
   return {
-    slotId: slot.id,
-    playerId,
-    inRole: rules.inRoles[slot.group][0],
-    outRole: rules.outRoles[slot.group][0]
+    score: fit * 36 + inRole.score * 0.85 + outRole.score * 0.65 + player.rating / 12,
+    assignment: {slotId: slot.id, playerId: player.id, inRole: inRole.role, outRole: outRole.role}
   };
+}
+
+function optimalAssignments(game, team, slots, players) {
+  const profile = team.controller === 'AI' ? profileForTeam(team) : null;
+  let states = Array(1 << slots.length).fill(null);
+  states[0] = {score: 0, assignments: []};
+
+  for (const playerId of team.squad) {
+    const player = players.find(candidate => candidate.id === playerId);
+    if (!player) continue;
+    const options = slots.map(slot => lineupOption(game, player, slot, profile));
+    const next = states.slice();
+    for (let mask = 0; mask < states.length; mask++) {
+      const state = states[mask];
+      if (!state) continue;
+      for (let slotIndex = 0; slotIndex < slots.length; slotIndex++) {
+        const bit = 1 << slotIndex;
+        if (mask & bit) continue;
+        const candidate = {
+          score: state.score + options[slotIndex].score,
+          assignments: [...state.assignments, options[slotIndex].assignment]
+        };
+        const nextMask = mask | bit;
+        if (!next[nextMask] || candidate.score > next[nextMask].score) next[nextMask] = candidate;
+      }
+    }
+    states = next;
+  }
+
+  return states[states.length - 1]?.assignments || [];
 }
 
 function autoLineup(game, team, players = PLAYERS) {
@@ -21,22 +59,10 @@ function autoLineup(game, team, players = PLAYERS) {
       delete team.customFormation;
     }
   } else if (!rules.formations[team.formation]) team.formation = Object.keys(rules.formations)[0];
-  const remaining = [...team.squad];
-  const assignments = [];
-
-  for (const slot of formationSlots(game, team.formation, team.customFormation)) {
-    const best = remaining.sort((leftId, rightId) => {
-      const left = players.find(player => player.id === leftId);
-      const right = players.find(player => player.id === rightId);
-      const leftScore = positionFit(left, slot) * 24 + roleScore(left, rules.inRoles[slot.group][0], slot.group) + left.rating / 20;
-      const rightScore = positionFit(right, slot) * 24 + roleScore(right, rules.inRoles[slot.group][0], slot.group) + right.rating / 20;
-      return rightScore - leftScore;
-    })[0];
-    if (best) {
-      assignments.push(defaultAssignment(game, slot, best));
-      remaining.splice(remaining.indexOf(best), 1);
-    }
-  }
+  const slots = formationSlots(game, team.formation, team.customFormation);
+  const slotOrder = new Map(slots.map((slot, index) => [slot.id, index]));
+  const assignments = optimalAssignments(game, team, slots, players)
+    .sort((left, right) => slotOrder.get(left.slotId) - slotOrder.get(right.slotId));
 
   team.assignments = assignments;
   team.starters = assignments.map(assignment => assignment.playerId);

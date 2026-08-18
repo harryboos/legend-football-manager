@@ -9,7 +9,7 @@ function clone(value) {
 
 function createRuleSnapshot() {
   return {
-    version: 2,
+    version: 4,
     teamCount: cfg.TEAM_COUNT,
     squadSize: cfg.SQUAD_SIZE,
     starters: cfg.STARTERS,
@@ -21,6 +21,17 @@ function createRuleSnapshot() {
     outRoles: clone(cfg.OUT_POSSESSION_ROLES),
     mentalities: [...cfg.MENTALITIES]
   };
+}
+
+function upgradeRuleSnapshot(snapshot) {
+  const rules = snapshot || createRuleSnapshot();
+  if (Number(rules.version) >= 4) return rules;
+  rules.formations = {...clone(cfg.FORMATIONS), ...(rules.formations || {})};
+  rules.inRoles = rules.inRoles || clone(cfg.IN_POSSESSION_ROLES);
+  rules.outRoles = rules.outRoles || clone(cfg.OUT_POSSESSION_ROLES);
+  rules.mentalities = Array.isArray(rules.mentalities) ? rules.mentalities : [...cfg.MENTALITIES];
+  rules.version = 4;
+  return rules;
 }
 
 function rulesFor(game) {
@@ -81,4 +92,4 @@ function formationSlots(game, formation, customFormation) {
   }));
 }
 
-module.exports = {CUSTOM_FORMATION, createRuleSnapshot, rulesFor, formationSlots, normalizeCustomFormation};
+module.exports = {CUSTOM_FORMATION, createRuleSnapshot, upgradeRuleSnapshot, rulesFor, formationSlots, normalizeCustomFormation};

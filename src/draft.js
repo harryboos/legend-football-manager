@@ -1,6 +1,6 @@
-const {groupForPosition} = require('./players');
 const {rulesFor} = require('./rules');
 const {autoLineup} = require('./lineup');
+const {candidateDraftScore} = require('./ai-manager');
 
 function availablePlayers(game) {
   const used = new Set(game.teams.flatMap(team => team.squad));
@@ -17,23 +17,11 @@ function currentDraftTeam(game) {
 }
 
 function aiChoice(game, team) {
-  const desired = {GK: 2, FB: 3, CB: 3, DM: 2, CM: 3, AM: 1, W: 2, ST: 2};
-  const counts = {};
-  team.squad
-    .map(id => game.players.find(player => player.id === id))
-    .filter(Boolean)
-    .forEach(player => {
-      const group = groupForPosition(player.position);
-      counts[group] = (counts[group] || 0) + 1;
-    });
-
-  return availablePlayers(game).sort((left, right) => {
-    const leftGroup = groupForPosition(left.position);
-    const rightGroup = groupForPosition(right.position);
-    const leftNeed = (desired[leftGroup] || 1) - (counts[leftGroup] || 0);
-    const rightNeed = (desired[rightGroup] || 1) - (counts[rightGroup] || 0);
-    return rightNeed - leftNeed || right.rating - left.rating;
-  })[0];
+  return availablePlayers(game)
+    .map(player => ({player, score: candidateDraftScore(game, team, player)}))
+    .sort((left, right) => right.score - left.score
+      || right.player.rating - left.player.rating
+      || left.player.name.localeCompare(right.player.name, 'zh-CN'))[0]?.player;
 }
 
 function draftPick(game, teamId, playerId) {

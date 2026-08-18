@@ -1,9 +1,10 @@
 const crypto = require('crypto');
 const {PLAYERS, ATTRIBUTE_LABELS, POSITION_LABELS, positionFit, roleScore} = require('./players');
-const {CUSTOM_FORMATION, createRuleSnapshot, rulesFor, formationSlots, normalizeCustomFormation} = require('./rules');
+const {CUSTOM_FORMATION, createRuleSnapshot, upgradeRuleSnapshot, rulesFor, formationSlots, normalizeCustomFormation} = require('./rules');
 const {createSchedule, rebalanceRemainingSchedule} = require('./schedule');
 const {availablePlayers, currentDraftTeam, aiChoice, draftPick, runAiDraft} = require('./draft');
 const {autoLineup, setLineup} = require('./lineup');
+const {formationForProfile, profileForIndex, profileForTeam} = require('./ai-manager');
 const {playRound, leagueTable} = require('./match');
 const {ensureGameReports} = require('./report');
 
@@ -23,30 +24,37 @@ function seedFromText(text) {
 }
 
 function createGame(name, host, options = {}) {
-  const rules = options.rules || createRuleSnapshot();
+  const rules = upgradeRuleSnapshot(options.rules || createRuleSnapshot());
   if (rules.teamCount !== TEAM_NAMES.length) throw new Error(`当前球队名称数量固定为 ${TEAM_NAMES.length}`);
   if (PLAYERS.length < rules.teamCount * rules.squadSize) throw new Error('球员数量不足以完成选秀');
-  const formation = Object.keys(rules.formations)[0];
-  const teams = TEAM_NAMES.map((teamName, index) => ({
-    id: `t${index + 1}`,
-    name: teamName,
-    controller: 'AI',
-    manager: '电脑经理',
-    squad: [],
-    starters: [],
-    assignments: [],
-    formation,
-    mentality: '平衡'
-  }));
+  const seed = options.seed >>> 0 || randomUint32();
+  const teams = TEAM_NAMES.map((teamName, index) => {
+    const profile = profileForIndex(index, seed);
+    const id = `t${index + 1}`;
+    return {
+      id,
+      name: teamName,
+      controller: 'AI',
+      manager: profile.manager,
+      managerStyle: profile.style,
+      aiProfile: profile.id,
+      squad: [],
+      starters: [],
+      assignments: [],
+      formation: formationForProfile(profile, seed, id, rules),
+      mentality: rules.mentalities.includes(profile.mentality) ? profile.mentality : '平衡'
+    };
+  });
   const hostTeam = options.hostTeamId ? teams.find(team => team.id === options.hostTeamId) : teams[0];
   if (!hostTeam) throw new Error('所选开局球队不存在');
   hostTeam.controller = 'human';
   hostTeam.manager = host || '房主';
-  const seed = options.seed >>> 0 || randomUint32();
+  hostTeam.managerStyle = '自定义';
 
   return {
     schemaVersion: 2,
     playerLibraryVersion: 2,
+    aiManagerVersion: 2,
     id: options.id || crypto.randomBytes(4).toString('hex').slice(0, 6).toUpperCase(),
     name: name || '传奇经理联赛',
     phase: 'lobby',
@@ -68,9 +76,10 @@ function createGame(name, host, options = {}) {
 
 function migrateGame(game) {
   const shouldRefreshLineups = game.playerLibraryVersion !== 2;
+  const shouldUpgradeAiManagers = game.aiManagerVersion !== 2;
   game.schemaVersion = 2;
   game.playerLibraryVersion = 2;
-  game.rules = game.rules || createRuleSnapshot();
+  game.rules = upgradeRuleSnapshot(game.rules || createRuleSnapshot());
   const rules = rulesFor(game);
   game.players = PLAYERS;
   game.seed = game.seed >>> 0 || seedFromText(game.id);
@@ -90,7 +99,17 @@ function migrateGame(game) {
   }
 
   const fallbackFormation = Object.keys(rules.formations)[0];
-  game.teams.forEach(team => {
+  game.teams.forEach((team, index) => {
+    const profile = team.aiProfile ? profileForTeam(team) : profileForIndex(index, game.seed);
+    team.aiProfile = profile.id;
+    if (team.controller === 'AI') {
+      team.managerStyle = profile.style;
+      if (!team.manager || team.manager === '电脑经理') team.manager = profile.manager;
+      if (shouldUpgradeAiManagers) {
+        team.formation = formationForProfile(profile, game.seed, team.id, rules);
+        if (rules.mentalities.includes(profile.mentality)) team.mentality = profile.mentality;
+      }
+    } else team.managerStyle = '自定义';
     if (team.formation === CUSTOM_FORMATION) {
       try {
         team.customFormation = normalizeCustomFormation(team.customFormation, rules.starters);
@@ -119,10 +138,12 @@ function migrateGame(game) {
   }
 
   game.teams.forEach(team => {
-    if (team.squad.length >= rules.starters && (shouldRefreshLineups || !Array.isArray(team.assignments) || team.assignments.length !== rules.starters)) {
+    const refreshAiLineup = shouldUpgradeAiManagers && team.controller === 'AI';
+    if (team.squad.length >= rules.starters && (shouldRefreshLineups || refreshAiLineup || !Array.isArray(team.assignments) || team.assignments.length !== rules.starters)) {
       autoLineup(game, team, game.players);
     }
   });
+  game.aiManagerVersion = 2;
   ensureGameReports(game);
   return game;
 }

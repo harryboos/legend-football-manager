@@ -56,6 +56,7 @@ function teamFacts(game, team) {
   return {
     id: team.id,
     name: team.name,
+    managerStyle: team.managerStyle || '自定义',
     formation: team.formation,
     shape: formationSlots(game, team.formation, team.customFormation),
     mentality: team.mentality,
@@ -78,7 +79,7 @@ function roundFacts(game, round) {
 
 function systemPrompt() {
   return [
-    '你是足球经理游戏的比赛模拟引擎，必须根据双方首发、位置适配、球员属性、职责、阵型、心态和球队指标决定赛果。',
+    '你是足球经理游戏的比赛模拟引擎，必须根据双方经理风格、首发、位置适配、球员属性、职责、阵型、心态和球队指标决定赛果。',
     '必须考虑每名球员的 heightCm、weightKg、assignedPosition 和 assignedFamiliarity：身高体重影响制空、对抗和灵活性；位置熟练度低必须显著降低该球员表现和评分，例如前腰客串中后卫不能按原有总评正常发挥。',
     '保持足球比分和事件数量真实，强队更可能获胜但允许合理冷门。不得使用输入之外的球员。',
     '每场必须提供全部22名首发及所有登场替补的评分，以及4至9个非进球关键事件；关键事件应包含浪费绝佳机会、关键传球和关键扑救等真实比赛节点。',

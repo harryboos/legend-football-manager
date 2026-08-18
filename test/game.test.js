@@ -17,6 +17,7 @@ const {
   positionFit
 } = require('../src/game');
 const {groupForPosition} = require('../src/players');
+const {profileForTeam} = require('../src/ai-manager');
 const {createGameStore, persistentGame} = require('../src/storage');
 const {createRequestHandler} = require('../src/api');
 const {createDeepSeekMatchService, DEEPSEEK_API_URL, DEEPSEEK_MODEL} = require('../src/match-ai');
@@ -122,6 +123,35 @@ test('房主创建联赛时可以选择任意开局球队', () => {
   assert.throws(() => createGame('错误球队', '玩家', {hostTeamId: 't99'}), /球队不存在/);
 });
 
+test('AI经理拥有差异化阵型、心态和选人风格', () => {
+  const game = createGame('AI经理测试', '玩家', {seed: 20260818});
+  const aiTeams = game.teams.filter(team => team.controller === 'AI');
+  assert.equal(Object.keys(game.rules.formations).length, 18);
+  assert.ok(Object.values(game.rules.formations).every(slots => slots.length === 11));
+  assert.equal(new Set(aiTeams.map(team => team.manager)).size, aiTeams.length);
+  assert.ok(new Set(aiTeams.map(team => team.formation)).size >= 10);
+  assert.equal(new Set(aiTeams.map(team => team.mentality)).size, 4);
+  assert.ok(aiTeams.every(team => team.aiProfile && team.managerStyle));
+  assert.ok(aiTeams.every(team => {
+    const profile = profileForTeam(team);
+    return [profile.formation, ...profile.formations].includes(team.formation);
+  }));
+});
+
+test('AI战术由房间种子决定且同种子结果稳定', () => {
+  const snapshot = game => game.teams.map(team => ({
+    manager: team.manager,
+    style: team.managerStyle,
+    formation: team.formation,
+    mentality: team.mentality
+  }));
+  const left = createGame('种子战术', '玩家', {seed: 7788, id: 'SEED01'});
+  const same = createGame('种子战术', '玩家', {seed: 7788, id: 'SEED02'});
+  const different = createGame('种子战术', '玩家', {seed: 7789, id: 'SEED03'});
+  assert.deepEqual(snapshot(left), snapshot(same));
+  assert.notDeepEqual(snapshot(left), snapshot(different));
+});
+
 test('球员库包含360名不重名真实球员且位置结构平衡', () => {
   const game = createGame('测试', '玩家');
   assert.equal(game.players.length, 360);
@@ -167,6 +197,7 @@ test('完整选秀生成18人阵容、11人职责且严重客串极少', () => {
   assert.ok(game.teams.every(team => team.assignments.every(assignment => assignment.inRole && assignment.outRole)));
   let poorFits = 0;
   for (const team of game.teams) {
+    assert.deepEqual(team.assignments.map(assignment => assignment.slotId), publicGame(game).config.formations[team.formation].map(slot => slot.id));
     for (const assignment of team.assignments) {
       const slot = publicGame(game).config.formations[team.formation].find(candidate => candidate.id === assignment.slotId);
       const player = game.players.find(candidate => candidate.id === assignment.playerId);
@@ -174,6 +205,40 @@ test('完整选秀生成18人阵容、11人职责且严重客串极少', () => {
     }
   }
   assert.ok(poorFits <= 5, `严重客串人数过多：${poorFits}`);
+  const aiTeams = game.teams.filter(team => team.controller === 'AI');
+  const squadShapes = aiTeams.map(team => {
+    const counts = {};
+    team.squad.forEach(id => {
+      const player = game.players.find(candidate => candidate.id === id);
+      const group = groupForPosition(player.position);
+      counts[group] = (counts[group] || 0) + 1;
+    });
+    return JSON.stringify(counts);
+  });
+  assert.ok(new Set(squadShapes).size >= 12, 'AI球队的位置结构过于相似');
+  assert.ok(new Set(aiTeams.flatMap(team => team.assignments.map(assignment => assignment.inRole))).size >= 14);
+  assert.ok(new Set(aiTeams.flatMap(team => team.assignments.map(assignment => assignment.outRole))).size >= 12);
+});
+
+test('旧存档会升级为差异化AI经理并获得新增阵型', () => {
+  const game = createGame('旧AI存档', '玩家', {seed: 20260818});
+  delete game.aiManagerVersion;
+  game.rules.version = 2;
+  for (const name of Object.keys(game.rules.formations).slice(4)) delete game.rules.formations[name];
+  game.teams.forEach((team, index) => {
+    team.formation = '4-3-3 DM';
+    if (index) {
+      team.manager = '电脑经理';
+      delete team.aiProfile;
+      delete team.managerStyle;
+    }
+  });
+  migrateGame(game);
+  const aiTeams = game.teams.filter(team => team.controller === 'AI');
+  assert.equal(game.rules.version, 4);
+  assert.equal(Object.keys(game.rules.formations).length, 18);
+  assert.ok(new Set(aiTeams.map(team => team.formation)).size >= 10);
+  assert.equal(new Set(aiTeams.map(team => team.manager)).size, aiTeams.length);
 });
 
 test('相同AI输出产生完全相同的赛季结果', async () => {

@@ -92,6 +92,7 @@ function createApiHandler({games, save, matchService = {available: false, model:
       if (!team) throw new HttpError(400, '所选球队不可用');
       team.controller = 'human';
       team.manager = limitedText(body.manager, '玩家', 24);
+      team.managerStyle = '自定义';
     } else if (action === 'start-draft') {
       if (current.phase !== 'lobby') throw new HttpError(400, '选秀已经开始');
       current.phase = 'draft';
