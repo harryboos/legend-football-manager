@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const game = require('./game');
+const {claimLegacyHost, createHostAccess, ensureAccess, issueTeamAccess, sessionForToken} = require('./access');
 
 const CONTENT_TYPES = {'.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.html': 'text/html; charset=utf-8'};
 
@@ -35,16 +36,37 @@ function limitedText(value, fallback, maximumLength) {
   return (text || fallback).slice(0, maximumLength);
 }
 
+function requestHeader(request, name) {
+  const value = request.headers?.[name];
+  return Array.isArray(value) ? value[0] : String(value || '');
+}
+
+function assertRevision(request, current) {
+  const supplied = Number(requestHeader(request, 'x-game-version'));
+  if (!requestHeader(request, 'x-game-version')) throw new HttpError(428, '缺少房间版本，请刷新页面后重试');
+  if (!Number.isInteger(supplied) || supplied !== current.revision) throw new HttpError(409, '房间数据已经更新，请刷新后重试');
+}
+
+function requireSession(current, token) {
+  const session = sessionForToken(current, token);
+  if (!session) throw new HttpError(401, '没有此房间的操作权限，请重新创建、加入或认领房间');
+  return session;
+}
+
 function createApiHandler({games, save, matchService = {available: false, model: 'deepseek-v4-flash'}}) {
-  const presentedGame = current => ({
+  const activeSimulations = new Set();
+  const presentedGame = (current, token, issuedSession) => ({
     ...game.publicGame(current),
     capabilities: {
       aiMatchEngine: Boolean(matchService.available),
       matchModel: matchService.model
-    }
+    },
+    access: {legacyClaimRequired: Boolean(ensureAccess(current).legacyClaimRequired)},
+    session: issuedSession || sessionForToken(current, token)
   });
 
   return async function handleApi(request, response, pathname) {
+    const token = requestHeader(request, 'x-game-token');
     const parts = pathname.split('/').filter(Boolean);
     if (parts[0] !== 'api' || parts[1] !== 'games') return false;
 
@@ -55,9 +77,10 @@ function createApiHandler({games, save, matchService = {available: false, model:
       do {
         created = game.createGame(limitedText(body.name, '传奇经理联赛', 40), limitedText(body.host, '房主', 24), {hostTeamId: body.teamId});
       } while (games[created.id]);
+      const session = createHostAccess(created, created.teams.find(team => team.controller === 'human').id);
       games[created.id] = created;
       save(games);
-      sendJson(response, 201, presentedGame(created));
+      sendJson(response, 201, presentedGame(created, session.token, session));
       return true;
     }
 
@@ -67,10 +90,13 @@ function createApiHandler({games, save, matchService = {available: false, model:
 
     if (parts.length === 3) {
       if (request.method === 'GET') {
-        sendJson(response, 200, presentedGame(current));
+        sendJson(response, 200, presentedGame(current, token));
         return true;
       }
       if (request.method === 'DELETE') {
+        const session = requireSession(current, token);
+        if (session.role !== 'host') throw new HttpError(403, '只有房主可以删除房间');
+        assertRevision(request, current);
         const body = await readJsonBody(request);
         if (String(body.confirmCode || '').trim().toUpperCase() !== current.id) throw new HttpError(400, '房间码确认不匹配');
         delete games[current.id];
@@ -85,6 +111,24 @@ function createApiHandler({games, save, matchService = {available: false, model:
     const body = await readJsonBody(request);
     const action = parts[3];
 
+    if (action === 'claim-host') {
+      assertRevision(request, current);
+      let session;
+      try {
+        session = claimLegacyHost(current, body.confirmCode);
+      } catch (error) {
+        throw new HttpError(400, error.message);
+      }
+      current.revision++;
+      save(games);
+      sendJson(response, 200, presentedGame(current, session.token, session));
+      return true;
+    }
+
+    if (activeSimulations.has(current.id)) throw new HttpError(409, '本房间正在模拟比赛，请等待当前任务完成');
+    assertRevision(request, current);
+    let issuedSession = null;
+
     if (action === 'join') {
       if (current.phase !== 'lobby') throw new HttpError(400, '联赛已经开始，无法加入');
       const team = current.teams.find(candidate => candidate.id === body.teamId && candidate.controller === 'AI')
@@ -93,16 +137,23 @@ function createApiHandler({games, save, matchService = {available: false, model:
       team.controller = 'human';
       team.manager = limitedText(body.manager, '玩家', 24);
       team.managerStyle = '自定义';
+      issuedSession = issueTeamAccess(current, team.id);
     } else if (action === 'start-draft') {
+      const session = requireSession(current, token);
+      if (session.role !== 'host') throw new HttpError(403, '只有房主可以开始选秀');
       if (current.phase !== 'lobby') throw new HttpError(400, '选秀已经开始');
       current.phase = 'draft';
       game.runAiDraft(current);
     } else if (action === 'pick') {
+      const session = requireSession(current, token);
+      if (session.teamId !== body.teamId) throw new HttpError(403, '只能为自己控制的球队选人');
       game.draftPick(current, body.teamId, body.playerId);
       game.runAiDraft(current);
     } else if (action === 'lineup') {
+      const session = requireSession(current, token);
+      if (session.teamId !== body.teamId) throw new HttpError(403, '只能修改自己控制的球队');
       const team = current.teams.find(candidate => candidate.id === body.teamId);
-      if (!team) throw new HttpError(400, '球队不存在');
+      if (!team || team.controller !== 'human') throw new HttpError(400, '球队不存在或不由真人控制');
       const rules = game.rulesFor(current);
       if (body.auto) {
         if (body.formation) {
@@ -120,26 +171,55 @@ function createApiHandler({games, save, matchService = {available: false, model:
         game.setLineup(current, team, body.formation, body.mentality, body.assignments, body.customFormation);
       }
     } else if (action === 'play-round') {
+      const session = requireSession(current, token);
+      if (session.role !== 'host') throw new HttpError(403, '只有房主可以模拟比赛');
       if (!matchService.available) throw new HttpError(400, '请先配置 DEEPSEEK_API_KEY 后再模拟比赛');
+      activeSimulations.add(current.id);
+      current.simulation = {status: 'running', mode: 'round', round: current.currentRound + 1, completedMatches: 0, totalMatches: current.rounds[current.currentRound]?.games.length || 0};
       try {
         await game.playRound(current, matchService);
+        current.revision++;
+        delete current.simulation;
+        save(games);
+        sendJson(response, 200, presentedGame(current, token));
+        return true;
       } catch (error) {
+        current.simulation = {status: 'error', mode: 'round', round: current.currentRound + 1, error: error.message};
+        save(games);
         throw new HttpError(502, `AI 比赛模拟失败，本轮未推进：${error.message}`);
+      } finally {
+        activeSimulations.delete(current.id);
       }
     } else if (action === 'play-all') {
+      const session = requireSession(current, token);
+      if (session.role !== 'host') throw new HttpError(403, '只有房主可以模拟比赛');
       if (!matchService.available) throw new HttpError(400, '请先配置 DEEPSEEK_API_KEY 后再模拟比赛');
+      activeSimulations.add(current.id);
       try {
-        while (current.phase === 'season') await game.playRound(current, matchService);
+        while (current.phase === 'season') {
+          current.simulation = {status: 'running', mode: 'season', round: current.currentRound + 1, completedMatches: 0, totalMatches: current.rounds[current.currentRound]?.games.length || 0};
+          await game.playRound(current, matchService);
+          current.revision++;
+          save(games);
+        }
+        delete current.simulation;
+        save(games);
+        sendJson(response, 200, presentedGame(current, token));
+        return true;
       } catch (error) {
+        current.simulation = {status: 'error', mode: 'season', round: current.currentRound + 1, error: error.message};
         save(games);
         throw new HttpError(502, `AI 整季模拟中断，已保存完成轮次：${error.message}`);
+      } finally {
+        activeSimulations.delete(current.id);
       }
     } else {
       throw new HttpError(404, '接口不存在');
     }
 
+    current.revision++;
     save(games);
-    sendJson(response, 200, presentedGame(current));
+    sendJson(response, 200, presentedGame(current, issuedSession?.token || token, issuedSession));
     return true;
   };
 }

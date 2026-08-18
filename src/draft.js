@@ -2,6 +2,23 @@ const {rulesFor} = require('./rules');
 const {autoLineup} = require('./lineup');
 const {candidateDraftScore} = require('./ai-manager');
 
+function randomDraftOrder(teamIds, seed) {
+  let state = (Number(seed) >>> 0) || 1;
+  const random = () => {
+    state = (state + 0x6D2B79F5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ value >>> 15, value | 1);
+    value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+  };
+  const order = [...teamIds];
+  for (let index = order.length - 1; index > 0; index--) {
+    const selected = Math.floor(random() * (index + 1));
+    [order[index], order[selected]] = [order[selected], order[index]];
+  }
+  return order;
+}
+
 function availablePlayers(game) {
   const used = new Set(game.teams.flatMap(team => team.squad));
   return game.players.filter(player => !used.has(player.id));
@@ -53,4 +70,4 @@ function runAiDraft(game) {
   }
 }
 
-module.exports = {availablePlayers, currentDraftTeam, aiChoice, draftPick, runAiDraft};
+module.exports = {availablePlayers, currentDraftTeam, randomDraftOrder, aiChoice, draftPick, runAiDraft};

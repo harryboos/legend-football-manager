@@ -1,6 +1,7 @@
 const {teamMetrics} = require('./lineup');
 const {formationSlots} = require('./rules');
 const {positionForSlot, positionFamiliarity} = require('./players');
+const {availabilityFor} = require('./season');
 
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
@@ -36,7 +37,7 @@ function lineupFacts(game, team) {
 
 function benchFacts(game, team) {
   const starters = new Set((team.assignments || []).map(assignment => assignment.playerId));
-  return (team.squad || []).filter(id => !starters.has(id)).map(id => {
+  return (team.squad || []).filter(id => !starters.has(id) && availabilityFor(game, id).available).map(id => {
     const player = game.players.find(candidate => candidate.id === id);
     return {
       id: player.id,
@@ -56,7 +57,9 @@ function teamFacts(game, team) {
   return {
     id: team.id,
     name: team.name,
+    controller: team.controller,
     managerStyle: team.managerStyle || '自定义',
+    matchPlan: team.matchPlan || null,
     formation: team.formation,
     shape: formationSlots(game, team.formation, team.customFormation),
     mentality: team.mentality,
@@ -82,7 +85,8 @@ function systemPrompt() {
     '你是足球经理游戏的比赛模拟引擎，必须根据双方经理风格、首发、位置适配、球员属性、职责、阵型、心态和球队指标决定赛果。',
     '必须考虑每名球员的 heightCm、weightKg、assignedPosition 和 assignedFamiliarity：身高体重影响制空、对抗和灵活性；位置熟练度低必须显著降低该球员表现和评分，例如前腰客串中后卫不能按原有总评正常发挥。',
     '保持足球比分和事件数量真实，强队更可能获胜但允许合理冷门。不得使用输入之外的球员。',
-    '每场必须提供全部22名首发及所有登场替补的评分，以及4至9个非进球关键事件；关键事件应包含浪费绝佳机会、关键传球和关键扑救等真实比赛节点。',
+    '每场必须提供全部22名首发及所有登场替补的评分，以及4至9个非进球关键事件；关键事件应包含浪费绝佳机会、关键传球和关键扑救等真实比赛节点。可以根据对抗情况生成0至1次 injury 事件，必须提供受伤球员 playerId、injury 和 recoveryMatches（1至8场）。',
+    '根据比分进程为 AI 控制球队生成 tactical_change 事件，描述其临场阵型、压迫或心态调整；该事件只需要 minute、type、teamId 和 description。',
     '每队安排1至3次合理换人。换人事件 type=substitution，playerId 是被换下球员，relatedPlayerId 是替补登场球员，替补必须来自该队 bench。',
     '每场提供 teamStats.home 与 teamStats.away，字段为 possession、shots、shotsOnTarget、bigChances、corners、fouls、passAccuracy，数据必须与比分和战报一致。',
     'playerRatings 中每名出场球员还必须提供整数 shots、passes、passesCompleted、yellowCards、redCards；成功传球不得超过传球数，个人合计应与球队射门及传球成功率一致。',
@@ -90,7 +94,7 @@ function systemPrompt() {
     '球员评分范围4.0至10.0，保留一位小数；playerOfMatch 应优先选择评分最高的参赛球员。',
     '只输出合法 json 对象，不要 Markdown，不要解释。JSON 格式示例：',
     '{"matches":[{"homeId":"t1","awayId":"t2","homeGoals":2,"awayGoals":1,"headline":"主队险胜","summary":"70至160字战报","tacticalNote":"30至90字战术观察","teamStats":{"home":{"possession":54,"shots":14,"shotsOnTarget":6,"bigChances":4,"corners":5,"fouls":11,"passAccuracy":87},"away":{"possession":46,"shots":9,"shotsOnTarget":3,"bigChances":2,"corners":3,"fouls":13,"passAccuracy":82}},"events":[{"minute":12,"type":"key_save","teamId":"t1","playerId":"p1","relatedPlayerId":"p2","description":"门将封出近距离射门"},{"minute":35,"type":"goal","teamId":"t1","playerId":"p3","relatedPlayerId":"p4","description":"接关键传球后低射破门"},{"minute":51,"type":"big_chance_missed","teamId":"t2","playerId":"p5","description":"单刀射门偏出"},{"minute":66,"type":"substitution","teamId":"t1","playerId":"p6","relatedPlayerId":"p12","description":"换上速度更快的边锋"}],"playerRatings":[{"playerId":"p1","teamId":"t1","rating":7.8,"note":"完成关键扑救","shots":0,"passes":38,"passesCompleted":34,"yellowCards":0,"redCards":0}],"playerOfMatch":"p3"}]}',
-    'type 只能是 goal、big_chance_missed、key_pass、key_save、substitution。description 和 note 使用简洁中文。'
+    'type 只能是 goal、big_chance_missed、key_pass、key_save、substitution、injury、tactical_change。description 和 note 使用简洁中文。'
   ].join('\n');
 }
 
@@ -108,9 +112,11 @@ function createDeepSeekMatchService(options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const batchSize = Math.max(1, Math.min(5, Number(options.batchSize) || DEFAULT_BATCH_SIZE));
   const timeoutMs = Number(options.timeoutMs) || 90_000;
+  const maxRetries = Math.max(0, Math.min(4, Number.isInteger(options.maxRetries) ? options.maxRetries : 2));
+  const retryDelayMs = Math.max(0, options.retryDelayMs === undefined ? 300 : Number(options.retryDelayMs) || 0);
   const available = Boolean(enabled && apiKey && fetchImpl);
 
-  async function requestBatch(game, round, fixtures, batchNumber) {
+  async function requestBatchOnce(game, round, fixtures, batchNumber) {
     let response;
     try {
       response = await fetchImpl(endpoint, {
@@ -148,17 +154,46 @@ function createDeepSeekMatchService(options = {}) {
     return parsed.matches;
   }
 
-  async function simulateRound(game, round) {
-    if (!available) throw new Error('尚未配置 DEEPSEEK_API_KEY，无法使用 AI 比赛引擎');
-    const batches = [];
-    for (let index = 0; index < round.games.length; index += batchSize) batches.push(round.games.slice(index, index + batchSize));
-    const settled = await Promise.allSettled(batches.map((fixtures, index) => requestBatch(game, round, fixtures, index + 1)));
-    const failed = settled.find(result => result.status === 'rejected');
-    if (failed) throw failed.reason;
-    return settled.flatMap(result => result.value);
+  async function requestBatch(game, round, fixtures, batchNumber) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await requestBatchOnce(game, round, fixtures, batchNumber);
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxRetries && retryDelayMs) {
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs * 2 ** attempt));
+        }
+      }
+    }
+    throw new Error(`${lastError.message}（已尝试 ${maxRetries + 1} 次）`);
   }
 
-  return {available, model, batchSize, simulateRound};
+  async function simulateRound(game, round) {
+    if (!available) throw new Error('尚未配置 DEEPSEEK_API_KEY，无法使用 AI 比赛引擎');
+    game.aiSimulationCache = game.aiSimulationCache && typeof game.aiSimulationCache === 'object' ? game.aiSimulationCache : {};
+    const roundKey = String(round.number);
+    const cache = game.aiSimulationCache[roundKey] && typeof game.aiSimulationCache[roundKey] === 'object'
+      ? game.aiSimulationCache[roundKey]
+      : (game.aiSimulationCache[roundKey] = {});
+    const keyFor = fixture => `${fixture.home}:${fixture.away}`;
+    const remaining = round.games.filter(fixture => !cache[keyFor(fixture)]);
+    const batches = [];
+    for (let index = 0; index < remaining.length; index += batchSize) batches.push(remaining.slice(index, index + batchSize));
+    const settled = await Promise.allSettled(batches.map(async (fixtures, index) => {
+      const matches = await requestBatch(game, round, fixtures, index + 1);
+      matches.forEach((match, matchIndex) => { cache[keyFor(fixtures[matchIndex])] = match; });
+      if (game.simulation) game.simulation.completedMatches = Object.keys(cache).length;
+      return matches;
+    }));
+    const failed = settled.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
+    const missing = round.games.find(fixture => !cache[keyFor(fixture)]);
+    if (missing) throw new Error(`AI 缓存缺少对阵 ${missing.home}:${missing.away}`);
+    return round.games.map(fixture => cache[keyFor(fixture)]);
+  }
+
+  return {available, model, batchSize, maxRetries, simulateRound};
 }
 
 module.exports = {DEEPSEEK_API_URL, DEEPSEEK_MODEL, DEFAULT_BATCH_SIZE, createDeepSeekMatchService, responseContent, roundFacts};

@@ -1,6 +1,9 @@
 const {REPORT_VERSION, snapshotLineup} = require('./report');
+const {autoLineup} = require('./lineup');
+const {matchPlanFor} = require('./ai-manager');
+const {availabilityFor, isPlayerAvailable, settleRoundStatuses, snapshotUnavailable} = require('./season');
 
-const EVENT_TYPES = new Set(['goal', 'big_chance_missed', 'key_pass', 'key_save', 'substitution']);
+const EVENT_TYPES = new Set(['goal', 'big_chance_missed', 'key_pass', 'key_save', 'substitution', 'injury', 'tactical_change']);
 
 function requiredText(value, field, maximumLength) {
   const text = String(value || '').trim();
@@ -17,9 +20,14 @@ function fixtureKey(home, away) {
   return `${home}:${away}`;
 }
 
-function snapshotBench(team) {
+function invalidateCachedFixture(game, roundNumber, fixture) {
+  const cache = game.aiSimulationCache?.[String(roundNumber)];
+  if (cache) delete cache[fixtureKey(fixture.home, fixture.away)];
+}
+
+function snapshotBench(game, team) {
   const starters = new Set((team.assignments || []).map(assignment => assignment.playerId));
-  return (team.squad || []).filter(playerId => !starters.has(playerId)).map(playerId => ({playerId, slotId: 'SUB'}));
+  return (team.squad || []).filter(playerId => !starters.has(playerId) && isPlayerAvailable(game, playerId)).map(playerId => ({playerId, slotId: 'SUB'}));
 }
 
 function participantMap(home, away, lineups, benches) {
@@ -37,13 +45,25 @@ function eventDescription(type) {
     big_chance_missed: '面对绝佳机会未能完成破门',
     key_pass: '送出穿透防线的关键传球',
     key_save: '门将完成一次关键扑救',
-    substitution: '球队完成换人调整'
+    substitution: '球队完成换人调整',
+    injury: '球员因伤无法继续坚持',
+    tactical_change: '主教练根据场上局势调整了战术'
   }[type];
 }
 
-function validatedEvents(rawEvents, participants, resultScore, lineups, benches) {
+function validatedEvents(rawEvents, participants, resultScore, lineups, benches, aiTeamIds) {
   const events = (Array.isArray(rawEvents) ? rawEvents : []).flatMap((event, index) => {
     if (!EVENT_TYPES.has(event.type)) return [];
+    if (event.type === 'tactical_change') {
+      if (![resultScore.homeId, resultScore.awayId].includes(event.teamId)) return [];
+      const parsedMinute = Math.round(Number(event.minute));
+      return [{
+        minute: Number.isFinite(parsedMinute) ? Math.max(1, Math.min(90, parsedMinute)) : 60,
+        type: event.type,
+        teamId: event.teamId,
+        description: String(event.description || '').trim().slice(0, 100) || eventDescription(event.type)
+      }];
+    }
     const expectedTeam = participants.get(event.playerId);
     if (!expectedTeam || expectedTeam !== event.teamId) return [];
     if (event.type === 'substitution' && (!event.relatedPlayerId || participants.get(event.relatedPlayerId) !== event.teamId)) return [];
@@ -55,6 +75,10 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches)
       teamId: event.teamId,
       playerId: event.playerId,
       ...(event.relatedPlayerId && participants.has(event.relatedPlayerId) ? {relatedPlayerId: event.relatedPlayerId} : {}),
+      ...(event.type === 'injury' ? {
+        injury: String(event.injury || '比赛中受伤').slice(0, 40),
+        recoveryMatches: statistic(event.recoveryMatches, 1, 1, 8)
+      } : {}),
       description: String(event.description || '').trim().slice(0, 100) || eventDescription(event.type)
     }];
   });
@@ -95,6 +119,20 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches)
       substitutions.push(generatedEvent('substitution', teamId, playerAt([...starters], -1), teamId === resultScore.homeId ? 64 : 69, playerAt([...bench], 0)));
     }
   }
+  const tacticalChanges = events.filter(event => event.type === 'tactical_change').slice(0, 4);
+  for (const teamId of aiTeamIds || []) {
+    if (!tacticalChanges.some(event => event.teamId === teamId)) {
+      tacticalChanges.push({
+        minute: teamId === resultScore.homeId ? 58 : 64,
+        type: 'tactical_change',
+        teamId,
+        description: resultScore.homeGoals === resultScore.awayGoals
+          ? '调整压迫和推进方式，尝试打破场上平衡'
+          : '根据比分变化重新分配攻守投入',
+        generated: true
+      });
+    }
+  }
   const entryMinute = new Map([
     ...lineups.home.map(entry => [entry.playerId, 1]),
     ...lineups.away.map(entry => [entry.playerId, 1]),
@@ -115,7 +153,7 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches)
     goals.push(...teamGoals);
   }
 
-  let highlights = events.filter(event => !['goal', 'substitution'].includes(event.type) && activeAt(event.playerId, event.minute)).sort((left, right) => left.minute - right.minute);
+  let highlights = events.filter(event => !['goal', 'substitution', 'tactical_change'].includes(event.type) && activeAt(event.playerId, event.minute)).sort((left, right) => left.minute - right.minute);
   const required = [
     ['key_pass', resultScore.homeId, -4, 16],
     ['big_chance_missed', resultScore.awayId, -1, 34],
@@ -130,7 +168,7 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches)
     highlights = [...selected, ...highlights.filter(event => !selected.includes(event))].slice(0, 9);
   }
 
-  return [...goals, ...highlights, ...substitutions]
+  return [...goals, ...highlights, ...substitutions, ...tacticalChanges]
     .map(event => event.type === 'substitution' || !event.relatedPlayerId || activeAt(event.relatedPlayerId, event.minute)
       ? event
       : Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'relatedPlayerId')))
@@ -308,11 +346,12 @@ function validatedMatch(game, fixture, round, raw, model) {
   const homeGoals = score(raw.homeGoals, '主队进球');
   const awayGoals = score(raw.awayGoals, '客队进球');
   const lineups = {home: snapshotLineup(home), away: snapshotLineup(away)};
-  const benches = {home: snapshotBench(home), away: snapshotBench(away)};
+  const benches = {home: snapshotBench(game, home), away: snapshotBench(game, away)};
   const participants = participantMap(home, away, lineups, benches);
   if (participants.size !== lineups.home.length + lineups.away.length + benches.home.length + benches.away.length) throw new Error('双方比赛名单存在重复球员');
   const resultScore = {homeId: home.id, awayId: away.id, homeGoals, awayGoals};
-  const events = validatedEvents(raw.events, participants, resultScore, lineups, benches);
+  const aiTeamIds = new Set([home, away].filter(team => team.controller === 'AI').map(team => team.id));
+  const events = validatedEvents(raw.events, participants, resultScore, lineups, benches, aiTeamIds);
   const playerRatings = validatedRatings(raw.playerRatings, participants, lineups, events);
   const bestRating = Math.max(...playerRatings.map(item => item.rating));
   const requestedBest = playerRatings.find(item => item.playerId === raw.playerOfMatch);
@@ -336,6 +375,7 @@ function validatedMatch(game, fixture, round, raw, model) {
     scorers,
     lineups,
     benches,
+    tacticalPlans: {home: home.matchPlan || null, away: away.matchPlan || null},
     report: {
       version: REPORT_VERSION,
       source: 'deepseek',
@@ -352,28 +392,74 @@ function validatedMatch(game, fixture, round, raw, model) {
   };
 }
 
+function prepareRoundLineups(game, round) {
+  const prepared = new Set();
+  for (const fixture of round.games) {
+    const home = game.teams.find(team => team.id === fixture.home);
+    const away = game.teams.find(team => team.id === fixture.away);
+    for (const [team, opponent] of [[home, away], [away, home]]) {
+      if (prepared.has(team.id)) continue;
+      if (team.controller === 'AI') {
+        const plan = matchPlanFor(game, team, opponent, round.number);
+        team.formation = plan.formation;
+        team.mentality = plan.mentality;
+        team.matchPlan = plan;
+        autoLineup(game, team, game.players);
+      } else if (!Array.isArray(team.assignments)
+        || team.assignments.length !== 11
+        || team.assignments.some(assignment => !isPlayerAvailable(game, assignment.playerId))) {
+        autoLineup(game, team, game.players);
+      }
+      if (!Array.isArray(team.assignments) || team.assignments.length !== 11) throw new Error(`${team.name}没有足够的可出场球员组成首发`);
+      const unavailable = team.assignments.find(assignment => !isPlayerAvailable(game, assignment.playerId));
+      if (unavailable) throw new Error(`${team.name}首发包含${availabilityFor(game, unavailable.playerId).label}的球员`);
+      prepared.add(team.id);
+    }
+  }
+}
+
 async function playRound(game, matchService) {
   if (game.phase !== 'season') throw new Error('赛季尚未开始');
   if (!matchService?.available) throw new Error('DeepSeek V4 Flash 比赛引擎尚未配置');
   const round = game.rounds[game.currentRound];
   if (!round) throw new Error('赛季已经结束');
+  const unavailableBeforeRound = snapshotUnavailable(game);
+  prepareRoundLineups(game, round);
   const generated = await matchService.simulateRound(game, round);
   if (!Array.isArray(generated) || generated.length !== round.games.length) throw new Error(`AI 必须返回本轮全部 ${round.games.length} 场比赛`);
   const generatedByFixture = new Map();
-  for (const raw of generated) {
+  for (const [index, raw] of generated.entries()) {
     const key = fixtureKey(raw?.homeId, raw?.awayId);
-    if (generatedByFixture.has(key)) throw new Error('AI 返回了重复对阵');
+    if (generatedByFixture.has(key)) {
+      invalidateCachedFixture(game, round.number, round.games[index]);
+      throw new Error('AI 返回了重复对阵');
+    }
     generatedByFixture.set(key, raw);
   }
   const validKeys = new Set(round.games.map(fixture => fixtureKey(fixture.home, fixture.away)));
-  if ([...generatedByFixture.keys()].some(key => !validKeys.has(key))) throw new Error('AI 返回了本轮之外的对阵');
-  const results = round.games.map(fixture => validatedMatch(
-    game,
-    fixture,
-    round.number,
-    generatedByFixture.get(fixtureKey(fixture.home, fixture.away)),
-    matchService.model
-  ));
+  if ([...generatedByFixture.keys()].some(key => !validKeys.has(key))) {
+    generated.forEach((raw, index) => {
+      if (!validKeys.has(fixtureKey(raw?.homeId, raw?.awayId))) invalidateCachedFixture(game, round.number, round.games[index]);
+    });
+    throw new Error('AI 返回了本轮之外的对阵');
+  }
+  const results = round.games.map(fixture => {
+    try {
+      return validatedMatch(
+        game,
+        fixture,
+        round.number,
+        generatedByFixture.get(fixtureKey(fixture.home, fixture.away)),
+        matchService.model
+      );
+    } catch (error) {
+      invalidateCachedFixture(game, round.number, fixture);
+      const home = game.teams.find(team => team.id === fixture.home)?.name || fixture.home;
+      const away = game.teams.find(team => team.id === fixture.away)?.name || fixture.away;
+      throw new Error(`${home} vs ${away}：${error.message}`);
+    }
+  });
+  settleRoundStatuses(game, results, unavailableBeforeRound);
 
   for (const result of results) {
     for (const scorer of result.scorers) game.scorers[scorer.player] = (game.scorers[scorer.player] || 0) + 1;
@@ -382,6 +468,7 @@ async function playRound(game, matchService) {
   round.played = true;
   game.currentRound++;
   if (game.currentRound >= game.rounds.length) game.phase = 'finished';
+  if (game.aiSimulationCache) delete game.aiSimulationCache[String(round.number)];
   return results;
 }
 

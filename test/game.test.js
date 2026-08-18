@@ -21,9 +21,13 @@ const {profileForTeam} = require('../src/ai-manager');
 const {createGameStore, persistentGame} = require('../src/storage');
 const {createRequestHandler} = require('../src/api');
 const {createDeepSeekMatchService, DEEPSEEK_API_URL, DEEPSEEK_MODEL} = require('../src/match-ai');
+const {createHostAccess} = require('../src/access');
+const {availabilityFor, buildSeasonStats, statusFor} = require('../src/season');
+const {currentDraftTeam, randomDraftOrder} = require('../src/draft');
 
 function completeDraft(game) {
   game.phase = 'draft';
+  runAiDraft(game);
   while (!game.draft.complete) {
     draftPick(game, 't1', publicGame(game).availablePlayers[0].id);
     runAiDraft(game);
@@ -84,10 +88,11 @@ function createFakeMatchService(transform) {
   };
 }
 
-function callHandler(handler, method, url, body) {
+function callHandler(handler, method, url, body, requestHeaders = {}) {
   const request = Readable.from(body ? [JSON.stringify(body)] : []);
   request.method = method;
   request.url = url;
+  request.headers = requestHeaders;
   let status;
   let headers;
   let payload = '';
@@ -113,6 +118,44 @@ test('生成20队、38轮且前半程主场数保持平衡', () => {
   assert.notEqual(pair[0].home, pair[1].home);
   const firstLegHomeCounts = game.teams.map(team => game.rounds.slice(0, 19).flatMap(round => round.games).filter(fixture => fixture.home === team.id).length);
   assert.ok(firstLegHomeCounts.every(count => count === 9 || count === 10));
+});
+
+test('球队首轮选秀顺序按房间种子随机且后续蛇形反转', () => {
+  const teamIds = Array.from({length: 20}, (_, index) => `t${index + 1}`);
+  const left = createGame('随机选秀', '玩家', {seed: 5201});
+  const same = createGame('随机选秀', '玩家', {seed: 5201});
+  const different = createGame('随机选秀', '玩家', {seed: 5202});
+  assert.deepEqual(left.draft.order, randomDraftOrder(teamIds, 5201));
+  assert.deepEqual(left.draft.order, same.draft.order);
+  assert.notDeepEqual(left.draft.order, different.draft.order);
+  assert.notDeepEqual(left.draft.order, teamIds);
+  assert.deepEqual([...left.draft.order].sort(), [...teamIds].sort());
+
+  left.phase = 'draft';
+  left.draft.pick = 0;
+  assert.equal(currentDraftTeam(left), left.draft.order[0]);
+  left.draft.pick = 19;
+  assert.equal(currentDraftTeam(left), left.draft.order[19]);
+  left.draft.pick = 20;
+  assert.equal(currentDraftTeam(left), left.draft.order[19]);
+  left.draft.pick = 39;
+  assert.equal(currentDraftTeam(left), left.draft.order[0]);
+});
+
+test('旧房间仅在选秀未开始时升级随机顺序', () => {
+  const teamIds = Array.from({length: 20}, (_, index) => `t${index + 1}`);
+  const lobby = createGame('旧大厅', '玩家', {seed: 5203});
+  lobby.draft.order = [...teamIds];
+  delete lobby.draft.orderVersion;
+  migrateGame(lobby);
+  assert.deepEqual(lobby.draft.order, randomDraftOrder(teamIds, lobby.seed));
+
+  const started = createGame('旧选秀', '玩家', {seed: 5204});
+  started.phase = 'draft';
+  started.draft.order = [...teamIds];
+  delete started.draft.orderVersion;
+  migrateGame(started);
+  assert.deepEqual(started.draft.order, teamIds);
 });
 
 test('房主创建联赛时可以选择任意开局球队', () => {
@@ -184,11 +227,14 @@ test('球员库包含360名不重名真实球员且位置结构平衡', () => {
 test('真人选择后AI自动选到下一位真人或选秀结束', () => {
   const game = createGame('测试', '玩家');
   game.phase = 'draft';
-  draftPick(game, 't1', game.players[0].id);
   runAiDraft(game);
-  assert.equal(game.draft.pick, 39);
+  const firstHumanPick = game.draft.pick;
+  draftPick(game, 't1', publicGame(game).availablePlayers[0].id);
+  runAiDraft(game);
+  assert.ok(game.draft.pick >= firstHumanPick + 1);
+  assert.equal(currentDraftTeam(game), 't1');
   assert.equal(game.teams[0].squad.length, 1);
-  assert.ok(game.teams.slice(1).every(team => team.squad.length === 2));
+  assert.ok(game.teams.slice(1).every(team => team.squad.length >= 1 && team.squad.length <= 2));
 });
 
 test('完整选秀生成18人阵容、11人职责且严重客串极少', () => {
@@ -437,6 +483,7 @@ test('DeepSeek分批超时会指出失败批次', async () => {
     apiKey: 'test-key',
     batchSize: 5,
     timeoutMs: 1_000,
+    maxRetries: 0,
     fetchImpl: async () => {
       calls++;
       if (calls === 1) {
@@ -448,6 +495,149 @@ test('DeepSeek分批超时会指出失败批次', async () => {
     }
   });
   await assert.rejects(service.simulateRound(game, game.rounds[0]), /第 1 批 DeepSeek 请求超过 1 秒/);
+});
+
+test('DeepSeek请求失败会自动重试并复用已完成批次', async () => {
+  const retryGame = completeDraft(createGame('自动重试', '玩家', {seed: 420}));
+  let retryCalls = 0;
+  const retryService = createDeepSeekMatchService({
+    enabled: true,
+    apiKey: 'test-key',
+    batchSize: 5,
+    maxRetries: 1,
+    retryDelayMs: 0,
+    fetchImpl: async () => {
+      retryCalls++;
+      if (retryCalls === 1) throw new Error('temporary network failure');
+      return {ok: true, json: async () => ({choices: [{message: {content: JSON.stringify({matches: Array(5).fill({})})}}]})};
+    }
+  });
+  assert.equal((await retryService.simulateRound(retryGame, retryGame.rounds[0])).length, 10);
+  assert.equal(retryCalls, 3);
+
+  const cachedGame = completeDraft(createGame('分批缓存', '玩家', {seed: 421}));
+  let batchCalls = 0;
+  const cachedService = createDeepSeekMatchService({
+    enabled: true,
+    apiKey: 'test-key',
+    batchSize: 5,
+    maxRetries: 0,
+    fetchImpl: async () => {
+      batchCalls++;
+      if (batchCalls === 1) throw new Error('first batch failed');
+      return {ok: true, json: async () => ({choices: [{message: {content: JSON.stringify({matches: Array(5).fill({})})}}]})};
+    }
+  });
+  await assert.rejects(cachedService.simulateRound(cachedGame, cachedGame.rounds[0]), /first batch failed/);
+  assert.equal(Object.keys(cachedGame.aiSimulationCache['1']).length, 5);
+  assert.equal((await cachedService.simulateRound(cachedGame, cachedGame.rounds[0])).length, 10);
+  assert.equal(batchCalls, 3);
+});
+
+test('AI业务校验失败后只重跑坏掉的单场缓存', async () => {
+  const game = completeDraft(createGame('坏场次自愈', '玩家', {seed: 427}));
+  const round = game.rounds[0];
+  let injectInvalid = true;
+  let calls = 0;
+  const service = createDeepSeekMatchService({
+    enabled: true,
+    apiKey: 'test-key',
+    batchSize: 2,
+    maxRetries: 0,
+    fetchImpl: async (url, options) => {
+      calls++;
+      const body = JSON.parse(options.body);
+      const content = body.messages[1].content;
+      const facts = JSON.parse(content.slice(content.indexOf('{')));
+      const matches = facts.fixtures.map(fixture => {
+        const fixtureIndex = round.games.findIndex(item => item.home === fixture.home.id && item.away === fixture.away.id);
+        const match = fakeMatch(game, round.games[fixtureIndex], round, fixtureIndex);
+        if (injectInvalid && fixtureIndex === 0) match.headline = '';
+        return match;
+      });
+      return {ok: true, json: async () => ({choices: [{message: {content: JSON.stringify({matches})}}]})};
+    }
+  });
+  await assert.rejects(playRound(game, service), /比赛数据缺少 战报标题/);
+  assert.equal(game.currentRound, 0);
+  assert.equal(Object.keys(game.aiSimulationCache['1']).length, 9);
+  injectInvalid = false;
+  await playRound(game, service);
+  assert.equal(game.currentRound, 1);
+  assert.equal(calls, 6);
+});
+
+test('黄牌累计与红牌会停赛且下一轮自动避开不可出场球员', async () => {
+  const game = completeDraft(createGame('纪律测试', '玩家', {seed: 422}));
+  const human = game.teams.find(team => team.controller === 'human');
+  const yellowPlayer = human.assignments[5].playerId;
+  const redPlayer = human.assignments[10].playerId;
+  statusFor(game, yellowPlayer).yellowCards = 4;
+  await playRound(game, createFakeMatchService());
+  assert.equal(statusFor(game, yellowPlayer).yellowCards, 0);
+  assert.equal(statusFor(game, yellowPlayer).suspensionMatches, 1);
+  assert.equal(statusFor(game, redPlayer).suspensionMatches, 1);
+  assert.equal(availabilityFor(game, yellowPlayer).type, 'suspended');
+
+  await playRound(game, createFakeMatchService());
+  const humanResult = game.results.find(result => result.round === 2 && [result.home, result.away].includes(human.id));
+  const side = humanResult.home === human.id ? 'home' : 'away';
+  assert.ok(!humanResult.lineups[side].some(item => item.playerId === yellowPlayer));
+  assert.ok(!humanResult.lineups[side].some(item => item.playerId === redPlayer));
+  assert.equal(statusFor(game, yellowPlayer).suspensionMatches, 0);
+  assert.equal(statusFor(game, redPlayer).suspensionMatches, 0);
+});
+
+test('伤病记录恢复轮数并禁止受伤球员进入阵容', async () => {
+  const game = completeDraft(createGame('伤病测试', '玩家', {seed: 423}));
+  let injuredPlayer;
+  const service = createFakeMatchService(matches => {
+    const match = matches[0];
+    injuredPlayer = match.playerRatings[3].playerId;
+    match.events.push({
+      minute: 48,
+      type: 'injury',
+      teamId: match.playerRatings[3].teamId,
+      playerId: injuredPlayer,
+      injury: '腿筋拉伤',
+      recoveryMatches: 3,
+      description: '冲刺后腿筋不适无法坚持'
+    });
+    return matches;
+  });
+  await playRound(game, service);
+  assert.equal(statusFor(game, injuredPlayer).injury, '腿筋拉伤');
+  assert.equal(statusFor(game, injuredPlayer).injuryMatches, 3);
+  assert.equal(availabilityFor(game, injuredPlayer).type, 'injured');
+  const club = game.teams.find(team => team.squad.includes(injuredPlayer));
+  assert.throws(() => setLineup(game, club, club.formation, club.mentality, club.assignments), /伤病/);
+});
+
+test('AI会生成赛前比赛计划和临场战术调整', async () => {
+  const game = completeDraft(createGame('AI调整测试', '玩家', {seed: 424}));
+  const results = await playRound(game, createFakeMatchService());
+  assert.ok(game.teams.filter(team => team.controller === 'AI').every(team => team.matchPlan?.round === 1));
+  for (const result of results) {
+    for (const teamId of [result.home, result.away].filter(id => game.teams.find(team => team.id === id).controller === 'AI')) {
+      assert.ok(result.report.events.some(event => event.type === 'tactical_change' && event.teamId === teamId));
+    }
+  }
+});
+
+test('完整赛季数据累计出场、射门、传球、纪律和球队统计', async () => {
+  const game = completeDraft(createGame('赛季统计', '玩家', {seed: 425}));
+  await playRound(game, createFakeMatchService());
+  const stats = buildSeasonStats(game);
+  assert.equal(stats.playerStats.length, 360);
+  assert.equal(stats.teamStats.length, 20);
+  assert.equal(stats.playerStats.reduce((sum, row) => sum + row.appearances, 0), game.results.reduce((sum, result) => sum + result.report.playerStats.length, 0));
+  assert.ok(stats.playerStats.some(row => row.shots > 0 && row.passes > 0 && row.averageRating > 0));
+  assert.ok(stats.playerStats.some(row => row.yellowCards > 0));
+  assert.ok(stats.playerStats.some(row => row.redCards > 0));
+  assert.ok(stats.teamStats.every(row => row.matches === 1 && row.shots > 0 && row.averagePassAccuracy > 0));
+  const state = publicGame(game);
+  assert.equal(state.seasonPlayerStats.length, 360);
+  assert.equal(state.seasonTeamStats.length, 20);
 });
 
 test('战术校验并完成动态轮数联赛', async () => {
@@ -513,9 +703,20 @@ test('旧版8人存档可迁移，未开始的旧赛程会升级', () => {
     team.starters = team.squad.slice(0, 5);
   });
   publicGame(game);
-  assert.equal(game.schemaVersion, 2);
+  assert.equal(game.schemaVersion, 3);
   assert.equal(game.scheduleVersion, 2);
   assert.ok(game.teams.every(team => team.squad.length === 18 && team.assignments.length === 11 && team.formation === '4-3-3 DM'));
+});
+
+test('旧赛季迁移时会从历史比赛重建累计黄牌与停赛', async () => {
+  const game = completeDraft(createGame('纪律迁移', '玩家', {seed: 428}));
+  await playRound(game, createFakeMatchService());
+  const yellow = game.results[0].report.playerStats.find(item => item.yellowCards > 0).playerId;
+  const red = game.results[0].report.playerStats.find(item => item.redCards > 0).playerId;
+  delete game.playerStatuses;
+  migrateGame(game);
+  assert.equal(statusFor(game, yellow).yellowCards, 1);
+  assert.equal(statusFor(game, red).suspensionMatches, 1);
 });
 
 test('进行中的旧赛季保留已赛轮次并重新平衡剩余赛程', () => {
@@ -567,7 +768,10 @@ test('API严格区分GET查询与POST操作', async () => {
   assert.equal(games[id].phase, 'lobby');
   const wrongNamespace = await callHandler(handler, 'GET', `/api/anything/${id}`);
   assert.equal(wrongNamespace.status, 404);
-  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {});
+  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+    'x-game-token': created.body.session.token,
+    'x-game-version': String(created.body.revision)
+  });
   assert.equal(started.status, 200);
   assert.equal(games[id].phase, 'draft');
   assert.equal(saves, 2);
@@ -579,12 +783,83 @@ test('真人玩家可选择未被占用的球队加入房间', async () => {
   const created = await callHandler(handler, 'POST', '/api/games', {name: '选队房间', host: '房主', teamId: 't8'});
   const id = created.body.id;
   assert.equal(games[id].teams.find(team => team.id === 't8').controller, 'human');
-  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第二玩家', teamId: 't3'});
+  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第二玩家', teamId: 't3'}, {
+    'x-game-version': String(created.body.revision)
+  });
   assert.equal(joined.status, 200);
+  assert.equal(joined.body.session.role, 'manager');
+  assert.ok(joined.body.session.token);
   assert.equal(games[id].teams.find(team => team.id === 't3').manager, '第二玩家');
-  const occupied = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第三玩家', teamId: 't3'});
+  const occupied = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第三玩家', teamId: 't3'}, {
+    'x-game-version': String(joined.body.revision)
+  });
   assert.equal(occupied.status, 400);
   assert.match(occupied.body.error, /不可用/);
+});
+
+test('多人权限隔离并拒绝过期版本写入', async () => {
+  const games = {};
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public')});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '权限房间', host: '房主'});
+  const id = created.body.id;
+  const hostToken = created.body.session.token;
+  const unauthorised = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+    'x-game-version': String(created.body.revision)
+  });
+  assert.equal(unauthorised.status, 401);
+  const stale = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+    'x-game-token': hostToken,
+    'x-game-version': String(created.body.revision + 1)
+  });
+  assert.equal(stale.status, 409);
+
+  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '客队经理', teamId: 't3'}, {
+    'x-game-version': String(created.body.revision)
+  });
+  const managerToken = joined.body.session.token;
+  const managerStart = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+    'x-game-token': managerToken,
+    'x-game-version': String(joined.body.revision)
+  });
+  assert.equal(managerStart.status, 403);
+  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+    'x-game-token': hostToken,
+    'x-game-version': String(joined.body.revision)
+  });
+  assert.equal(started.status, 200);
+  const forbiddenPick = await callHandler(handler, 'POST', `/api/games/${id}/pick`, {
+    teamId: 't1',
+    playerId: started.body.availablePlayers[0].id
+  }, {'x-game-token': managerToken, 'x-game-version': String(started.body.revision)});
+  assert.equal(forbiddenPick.status, 403);
+});
+
+test('同一房间只允许一个比赛模拟任务运行', async () => {
+  const game = completeDraft(createGame('并发测试', '房主', {id: 'LOCK01', seed: 426}));
+  const session = createHostAccess(game, 't1');
+  const games = {[game.id]: game};
+  const base = createFakeMatchService();
+  let release;
+  const delayed = {
+    available: true,
+    model: DEEPSEEK_MODEL,
+    async simulateRound(current, round) {
+      await new Promise(resolve => { release = resolve; });
+      return base.simulateRound(current, round);
+    }
+  };
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: delayed});
+  const headers = {'x-game-token': session.token, 'x-game-version': String(game.revision)};
+  const first = callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, headers);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof release, 'function');
+  const concurrent = await callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, headers);
+  assert.equal(concurrent.status, 409);
+  assert.match(concurrent.body.error, /正在模拟/);
+  release();
+  const completed = await first;
+  assert.equal(completed.status, 200);
+  assert.equal(completed.body.currentRound, 1);
 });
 
 test('删除房间必须使用DELETE并准确确认房间码', async () => {
@@ -593,11 +868,12 @@ test('删除房间必须使用DELETE并准确确认房间码', async () => {
   const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public')});
   const created = await callHandler(handler, 'POST', '/api/games', {name: '待删除房间', host: '房主'});
   const id = created.body.id;
-  const wrongConfirmation = await callHandler(handler, 'DELETE', `/api/games/${id}`, {confirmCode: 'WRONG1'});
+  const permissionHeaders = {'x-game-token': created.body.session.token, 'x-game-version': String(created.body.revision)};
+  const wrongConfirmation = await callHandler(handler, 'DELETE', `/api/games/${id}`, {confirmCode: 'WRONG1'}, permissionHeaders);
   assert.equal(wrongConfirmation.status, 400);
   assert.ok(games[id]);
   assert.equal(saves, 1);
-  const deleted = await callHandler(handler, 'DELETE', `/api/games/${id}`, {confirmCode: id.toLowerCase()});
+  const deleted = await callHandler(handler, 'DELETE', `/api/games/${id}`, {confirmCode: id.toLowerCase()}, permissionHeaders);
   assert.equal(deleted.status, 200);
   assert.deepEqual(deleted.body, {deleted: true, id});
   assert.equal(games[id], undefined);
@@ -607,9 +883,13 @@ test('删除房间必须使用DELETE并准确确认房间码', async () => {
 test('未配置DeepSeek密钥时API拒绝模拟且不推进轮次', async () => {
   const game = completeDraft(createGame('缺少密钥', '玩家', {id: 'NOKEY1'}));
   const games = {[game.id]: game};
+  const session = createHostAccess(game, 't1');
   let saves = 0;
   const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public')});
-  const response = await callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {});
+  const response = await callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, {
+    'x-game-token': session.token,
+    'x-game-version': String(game.revision)
+  });
   assert.equal(response.status, 400);
   assert.match(response.body.error, /DEEPSEEK_API_KEY/);
   assert.equal(game.currentRound, 0);
@@ -622,15 +902,21 @@ test('API可以完成选秀、自动排阵和整季模拟', async () => {
   const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: createFakeMatchService()});
   const created = await callHandler(handler, 'POST', '/api/games', {name: '完整流程', host: '房主'});
   const id = created.body.id;
-  await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {});
+  const token = created.body.session.token;
+  let revision = created.body.revision;
+  const mutationHeaders = () => ({'x-game-token': token, 'x-game-version': String(revision)});
+  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, mutationHeaders());
+  assert.equal(started.status, 200);
+  revision = started.body.revision;
 
   while (!games[id].draft.complete) {
     const state = publicGame(games[id]);
     const picked = await callHandler(handler, 'POST', `/api/games/${id}/pick`, {
       teamId: state.currentDraftTeam,
       playerId: state.availablePlayers[0].id
-    });
+    }, mutationHeaders());
     assert.equal(picked.status, 200);
+    revision = picked.body.revision;
   }
 
   const customFormation = [
@@ -643,8 +929,9 @@ test('API可以完成选秀、自动排阵和整季模拟', async () => {
     formation: '自定义',
     customFormation,
     mentality: '平衡'
-  });
+  }, mutationHeaders());
   assert.equal(customLineup.status, 200);
+  revision = customLineup.body.revision;
   assert.equal(games[id].teams[0].formation, '自定义');
   assert.equal(games[id].teams[0].customFormation.length, 11);
 
@@ -653,14 +940,17 @@ test('API可以完成选秀、自动排阵和整季模拟', async () => {
     auto: true,
     formation: '4-4-2',
     mentality: '积极'
-  });
+  }, mutationHeaders());
   assert.equal(lineup.status, 200);
+  revision = lineup.body.revision;
   assert.equal(games[id].teams[0].formation, '4-4-2');
-  const round = await callHandler(handler, 'POST', `/api/games/${id}/play-round`, {});
+  const round = await callHandler(handler, 'POST', `/api/games/${id}/play-round`, {}, mutationHeaders());
+  assert.equal(round.status, 200);
+  revision = round.body.revision;
   assert.equal(round.body.currentRound, 1);
   assert.equal(round.body.results[0].report.source, 'deepseek');
   assert.ok(round.body.results[0].report.events.some(event => event.type === 'key_save'));
-  const finished = await callHandler(handler, 'POST', `/api/games/${id}/play-all`, {});
+  const finished = await callHandler(handler, 'POST', `/api/games/${id}/play-all`, {}, mutationHeaders());
   assert.equal(finished.body.phase, 'finished');
   assert.equal(finished.body.results.length, 380);
 });

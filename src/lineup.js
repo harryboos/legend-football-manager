@@ -1,6 +1,7 @@
 const {PLAYERS, positionFit, roleScore} = require('./players');
 const {CUSTOM_FORMATION, formationSlots, normalizeCustomFormation, rulesFor} = require('./rules');
 const {profileForTeam, roleBias} = require('./ai-manager');
+const {availabilityFor, isPlayerAvailable} = require('./season');
 
 function bestRole(player, roles, group, profile, phase) {
   return roles
@@ -24,7 +25,7 @@ function optimalAssignments(game, team, slots, players) {
   let states = Array(1 << slots.length).fill(null);
   states[0] = {score: 0, assignments: []};
 
-  for (const playerId of team.squad) {
+  for (const playerId of team.squad.filter(playerId => isPlayerAvailable(game, playerId))) {
     const player = players.find(candidate => candidate.id === playerId);
     if (!player) continue;
     const options = slots.map(slot => lineupOption(game, player, slot, profile));
@@ -90,6 +91,8 @@ function setLineup(game, team, formation, mentality, assignments, customFormatio
   for (const assignment of assignments) {
     const slot = slotMap.get(assignment.slotId);
     if (!slot || !team.squad.includes(assignment.playerId)) throw new Error('阵容位置或球员无效');
+    const availability = availabilityFor(game, assignment.playerId);
+    if (!availability.available) throw new Error(`${availability.label}的球员不能进入首发`);
     if (!rules.inRoles[slot.group].includes(assignment.inRole) || !rules.outRoles[slot.group].includes(assignment.outRole)) {
       throw new Error(`${slot.label}的职责无效`);
     }

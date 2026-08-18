@@ -130,6 +130,32 @@ function formationForProfile(profile, seed, teamId, rules) {
   return weighted[Math.min(index, weighted.length - 1)];
 }
 
+function squadStrength(game, team) {
+  const ratings = team.squad.map(id => game.players.find(player => player.id === id)?.rating).filter(Number.isFinite);
+  return ratings.length ? ratings.reduce((sum, rating) => sum + rating, 0) / ratings.length : 0;
+}
+
+function matchPlanFor(game, team, opponent, roundNumber) {
+  const rules = rulesFor(game);
+  const profile = profileForTeam(team);
+  const candidates = [profile.formation, ...(profile.formations || [])]
+    .filter((formation, index, list) => rules.formations[formation] && list.indexOf(formation) === index);
+  const roll = seededValue(game.seed, `match-plan:${roundNumber}:${team.id}:${opponent.id}`);
+  const formation = candidates[Math.min(candidates.length - 1, Math.floor(roll * candidates.length))]
+    || team.formation;
+  const ownStrength = squadStrength(game, team);
+  const opponentStrength = squadStrength(game, opponent);
+  const baseIndex = Math.max(0, rules.mentalities.indexOf(profile.mentality));
+  const adjustment = ownStrength > opponentStrength + 1.2 ? 1 : ownStrength + 1.2 < opponentStrength ? -1 : 0;
+  const mentality = rules.mentalities[Math.max(0, Math.min(rules.mentalities.length - 1, baseIndex + adjustment))];
+  const reason = adjustment > 0
+    ? '实力占优，主动提高进攻投入'
+    : adjustment < 0
+      ? '面对强敌，优先保持防守结构'
+      : `根据对手的 ${opponent.formation} 在本队风格内调整站位`;
+  return {round: roundNumber, opponentId: opponent.id, formation, mentality, style: profile.style, reason};
+}
+
 function squadPlanFor(game, team) {
   if (FORMATION_PLANS[team.formation]) return FORMATION_PLANS[team.formation];
   const rules = rulesFor(game);
@@ -203,6 +229,7 @@ module.exports = {
   AI_MANAGER_PROFILES,
   candidateDraftScore,
   formationForProfile,
+  matchPlanFor,
   profileForIndex,
   profileForTeam,
   roleBias,
