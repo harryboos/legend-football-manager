@@ -96,6 +96,7 @@ const OUT_POSSESSION_ROLES = {
 
 module.exports = {
   PORT: Number(process.env.PORT || 3000),
+  SITE_ACCESS_KEY: process.env.SITE_ACCESS_KEY || '',
   TEAM_COUNT: 20,
   SQUAD_SIZE: 18,
   STARTERS: 11,

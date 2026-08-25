@@ -86,6 +86,7 @@ function systemPrompt() {
     '必须考虑每名球员的 heightCm、weightKg、assignedPosition 和 assignedFamiliarity：身高体重影响制空、对抗和灵活性；位置熟练度低必须显著降低该球员表现和评分，例如前腰客串中后卫不能按原有总评正常发挥。',
     '保持足球比分和事件数量真实，强队更可能获胜但允许合理冷门。不得使用输入之外的球员。',
     '每场必须提供全部22名首发及所有登场替补的评分，以及4至9个非进球关键事件；关键事件应包含浪费绝佳机会、关键传球和关键扑救等真实比赛节点。可以根据对抗情况生成0至1次 injury 事件，必须提供受伤球员 playerId、injury 和 recoveryMatches（1至8场）。',
+    'playerRatings 中 redCards=1 的每名球员都必须有对应 red_card 事件，并提供真实的罚下分钟；球员被罚下后不能再参与后续事件。',
     '根据比分进程为 AI 控制球队生成 tactical_change 事件，描述其临场阵型、压迫或心态调整；该事件只需要 minute、type、teamId 和 description。',
     '每队安排1至3次合理换人。换人事件 type=substitution，playerId 是被换下球员，relatedPlayerId 是替补登场球员，替补必须来自该队 bench。',
     '每场提供 teamStats.home 与 teamStats.away，字段为 possession、shots、shotsOnTarget、bigChances、corners、fouls、passAccuracy，数据必须与比分和战报一致。',
@@ -94,7 +95,7 @@ function systemPrompt() {
     '球员评分范围4.0至10.0，保留一位小数；playerOfMatch 应优先选择评分最高的参赛球员。',
     '只输出合法 json 对象，不要 Markdown，不要解释。JSON 格式示例：',
     '{"matches":[{"homeId":"t1","awayId":"t2","homeGoals":2,"awayGoals":1,"headline":"主队险胜","summary":"70至160字战报","tacticalNote":"30至90字战术观察","teamStats":{"home":{"possession":54,"shots":14,"shotsOnTarget":6,"bigChances":4,"corners":5,"fouls":11,"passAccuracy":87},"away":{"possession":46,"shots":9,"shotsOnTarget":3,"bigChances":2,"corners":3,"fouls":13,"passAccuracy":82}},"events":[{"minute":12,"type":"key_save","teamId":"t1","playerId":"p1","relatedPlayerId":"p2","description":"门将封出近距离射门"},{"minute":35,"type":"goal","teamId":"t1","playerId":"p3","relatedPlayerId":"p4","description":"接关键传球后低射破门"},{"minute":51,"type":"big_chance_missed","teamId":"t2","playerId":"p5","description":"单刀射门偏出"},{"minute":66,"type":"substitution","teamId":"t1","playerId":"p6","relatedPlayerId":"p12","description":"换上速度更快的边锋"}],"playerRatings":[{"playerId":"p1","teamId":"t1","rating":7.8,"note":"完成关键扑救","shots":0,"passes":38,"passesCompleted":34,"yellowCards":0,"redCards":0}],"playerOfMatch":"p3"}]}',
-    'type 只能是 goal、big_chance_missed、key_pass、key_save、substitution、injury、tactical_change。description 和 note 使用简洁中文。'
+    'type 只能是 goal、big_chance_missed、key_pass、key_save、substitution、injury、red_card、tactical_change。description 和 note 使用简洁中文。'
   ].join('\n');
 }
 

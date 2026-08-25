@@ -80,6 +80,21 @@ function generatedInjuryEvents(game, result) {
   return events;
 }
 
+function applyInjuryMinutes(result) {
+  const stats = new Map((result.report?.playerStats || []).map(item => [item.playerId, item]));
+  const entries = new Map((result.report?.events || []).filter(event => event.type === 'substitution')
+    .map(event => [event.relatedPlayerId, event.minute]));
+  for (const event of result.report?.events || []) {
+    if (event.type !== 'injury') continue;
+    const item = stats.get(event.playerId);
+    if (!item) continue;
+    const minutes = item.started
+      ? event.minute
+      : Math.max(0, event.minute - (entries.get(event.playerId) || event.minute));
+    item.minutes = Math.min(item.minutes, minutes);
+  }
+}
+
 function settleRoundStatuses(game, results, unavailableBeforeRound) {
   ensurePlayerStatuses(game);
   for (const [playerId, previous] of Object.entries(unavailableBeforeRound || {})) {
@@ -92,6 +107,7 @@ function settleRoundStatuses(game, results, unavailableBeforeRound) {
   for (const result of results) {
     const generated = generatedInjuryEvents(game, result);
     if (generated.length) result.report.events = [...result.report.events, ...generated].sort((left, right) => left.minute - right.minute);
+    applyInjuryMinutes(result);
     for (const item of result.report.playerStats || []) {
       const status = statusFor(game, item.playerId);
       status.yellowCards += Math.max(0, Number(item.yellowCards) || 0);

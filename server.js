@@ -3,6 +3,8 @@ const path = require('path');
 const cfg = require('./config');
 const {createGameStore} = require('./src/storage');
 const {createRequestHandler} = require('./src/api');
+const {createAuthService} = require('./src/auth');
+const {createSiteGate} = require('./src/site-gate');
 const {createDeepSeekMatchService} = require('./src/match-ai');
 
 function createApplication(options = {}) {
@@ -11,8 +13,10 @@ function createApplication(options = {}) {
   const store = options.store || createGameStore(dataFile);
   const games = options.games || store.load();
   const matchService = options.matchService || createDeepSeekMatchService();
-  const handler = createRequestHandler({games, save: current => store.save(current), publicDirectory, matchService});
-  return {server: http.createServer(handler), handler, games, store, matchService};
+  const auth = options.auth || createAuthService({file: options.authFile || path.join(__dirname, 'data', 'auth.json')});
+  const siteGate = options.siteGate || createSiteGate(options.siteAccessKey === undefined ? cfg.SITE_ACCESS_KEY : options.siteAccessKey);
+  const handler = createRequestHandler({games, save: current => store.save(current), publicDirectory, matchService, auth, siteGate});
+  return {server: http.createServer(handler), handler, games, store, matchService, auth, siteGate};
 }
 
 if (require.main === module) {

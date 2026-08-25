@@ -131,6 +131,48 @@ function hasCompleteReport(result, expectedRatings) {
     && report.playerRatings.every(item => item.playerId && Number.isFinite(item.rating));
 }
 
+function ensureRedCardEvents(report) {
+  const events = report.events || (report.events = []);
+  const entries = new Map(events.filter(event => event.type === 'substitution')
+    .map(event => [event.relatedPlayerId, event.minute]));
+  for (const item of report.playerStats || []) {
+    if (!(Number(item.redCards) > 0) || events.some(event => event.type === 'red_card' && event.playerId === item.playerId)) continue;
+    const entered = entries.get(item.playerId) || 1;
+    const laterExit = events.filter(event => ['substitution', 'injury'].includes(event.type) && event.playerId === item.playerId)
+      .reduce((minimum, event) => Math.min(minimum, event.minute), 90);
+    const minute = Math.max(entered, Math.min(72, laterExit - 1));
+    events.push({
+      minute,
+      type: 'red_card',
+      teamId: item.teamId,
+      playerId: item.playerId,
+      description: '球员被红牌罚下',
+      generated: true
+    });
+  }
+  events.sort((left, right) => left.minute - right.minute);
+}
+
+function reconcileEventMinutes(report) {
+  const byPlayer = new Map((report.playerStats || []).map(item => [item.playerId, item]));
+  const starters = new Set((report.playerRatings || []).filter(item => item.slotId !== 'SUB').map(item => item.playerId));
+  const entries = new Map();
+  for (const event of (report.events || []).filter(item => item.type === 'substitution')) {
+    entries.set(event.relatedPlayerId, event.minute);
+    const outgoing = byPlayer.get(event.playerId);
+    const incoming = byPlayer.get(event.relatedPlayerId);
+    if (outgoing) outgoing.minutes = Math.min(Number(outgoing.minutes) || 90, event.minute);
+    if (incoming) incoming.minutes = Math.max(Number(incoming.minutes) || 0, 90 - event.minute);
+  }
+  for (const event of (report.events || []).filter(item => ['injury', 'red_card'].includes(item.type))) {
+    const item = byPlayer.get(event.playerId);
+    if (!item) continue;
+    const started = item.started === true || starters.has(event.playerId);
+    const played = started ? event.minute : Math.max(0, event.minute - (entries.get(event.playerId) || event.minute));
+    item.minutes = Math.min(Number(item.minutes) || 90, played);
+  }
+}
+
 function ensureReportStats(result) {
   const report = result.report;
   if (!report) return;
@@ -161,6 +203,8 @@ function ensureReportStats(result) {
     }
     report.playerStats = playerStats;
   }
+  ensureRedCardEvents(report);
+  reconcileEventMinutes(report);
   for (const item of report.playerStats) {
     const minimumShots = (Number(item.goals) || 0) + (Number(item.bigChancesMissed) || 0);
     item.shots = Math.max(minimumShots, Number.isFinite(Number(item.shots)) ? Math.round(Number(item.shots)) : minimumShots);

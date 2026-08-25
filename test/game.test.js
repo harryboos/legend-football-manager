@@ -20,10 +20,14 @@ const {groupForPosition} = require('../src/players');
 const {profileForTeam} = require('../src/ai-manager');
 const {createGameStore, persistentGame} = require('../src/storage');
 const {createRequestHandler} = require('../src/api');
+const {createAuthService} = require('../src/auth');
+const {createSiteGate} = require('../src/site-gate');
 const {createDeepSeekMatchService, DEEPSEEK_API_URL, DEEPSEEK_MODEL} = require('../src/match-ai');
-const {createHostAccess} = require('../src/access');
+const {createHostOwnership} = require('../src/access');
 const {availabilityFor, buildSeasonStats, statusFor} = require('../src/season');
 const {currentDraftTeam, randomDraftOrder} = require('../src/draft');
+const ACCOUNT_PASSWORD = 'legend-test-123';
+let accountSequence = 0;
 
 function completeDraft(game) {
   game.phase = 'draft';
@@ -106,6 +110,19 @@ function callHandler(handler, method, url, body, requestHeaders = {}) {
     }
   };
   return handler(request, response).then(() => ({status, headers, body: payload ? JSON.parse(payload) : null}));
+}
+
+function createTestAccount(auth) {
+  const result = auth.register(`user_${++accountSequence}`, ACCOUNT_PASSWORD);
+  return {user: result.user, cookie: `lfm_session=${result.token}`};
+}
+
+function accountHeaders(account, extra = {}) {
+  return {cookie: account.cookie, ...extra};
+}
+
+function responseCookie(response) {
+  return String(response.headers?.['set-cookie'] || '').split(';')[0];
 }
 
 test('生成20队、38轮且前半程主场数保持平衡', () => {
@@ -331,8 +348,12 @@ test('DeepSeek决定赛果并生成关键事件、换人和所有出场球员数
     for (const substitution of substitutions) {
       const outgoing = result.report.playerStats.find(item => item.playerId === substitution.playerId);
       const incoming = result.report.playerStats.find(item => item.playerId === substitution.relatedPlayerId);
-      assert.equal(outgoing.minutes, substitution.minute);
-      assert.equal(incoming.minutes, 90 - substitution.minute);
+      const outgoingExit = result.report.events.filter(event => ['injury', 'red_card'].includes(event.type) && event.playerId === substitution.playerId)
+        .reduce((minute, event) => Math.min(minute, event.minute), substitution.minute);
+      const incomingExit = result.report.events.filter(event => ['injury', 'red_card'].includes(event.type) && event.playerId === substitution.relatedPlayerId)
+        .reduce((minute, event) => Math.min(minute, event.minute), 90);
+      assert.equal(outgoing.minutes, outgoingExit);
+      assert.equal(incoming.minutes, Math.max(0, incomingExit - substitution.minute));
       assert.equal(incoming.started, false);
     }
     assert.ok(result.report.events.every((event, index, events) => event.minute >= 1 && event.minute <= 90 && (!index || events[index - 1].minute <= event.minute)));
@@ -358,7 +379,7 @@ test('AI关键事件不足时自动补齐且保持比分一致', async () => {
     return matches;
   });
   const [result] = await playRound(game, service);
-  const highlights = result.report.events.filter(event => !['goal', 'substitution'].includes(event.type));
+  const highlights = result.report.events.filter(event => !['goal', 'substitution', 'red_card', 'tactical_change'].includes(event.type));
   assert.equal(result.report.events.filter(event => event.type === 'goal').length, result.homeGoals + result.awayGoals);
   assert.ok(highlights.length >= 4 && highlights.length <= 9);
   assert.ok(['big_chance_missed', 'key_pass', 'key_save'].every(type => highlights.some(event => event.type === type)));
@@ -401,8 +422,12 @@ test('AI返回的多次合法换人会保留并生成准确出场时间', async 
   for (const event of substitutions) {
     const outgoing = result.report.playerStats.find(item => item.playerId === event.playerId);
     const incoming = result.report.playerStats.find(item => item.playerId === event.relatedPlayerId);
-    assert.equal(outgoing.minutes, event.minute);
-    assert.equal(incoming.minutes, 90 - event.minute);
+    const outgoingExit = result.report.events.filter(item => ['injury', 'red_card'].includes(item.type) && item.playerId === event.playerId)
+      .reduce((minute, item) => Math.min(minute, item.minute), event.minute);
+    const incomingExit = result.report.events.filter(item => ['injury', 'red_card'].includes(item.type) && item.playerId === event.relatedPlayerId)
+      .reduce((minute, item) => Math.min(minute, item.minute), 90);
+    assert.equal(outgoing.minutes, outgoingExit);
+    assert.equal(incoming.minutes, Math.max(0, incomingExit - event.minute));
   }
 });
 
@@ -605,12 +630,46 @@ test('伤病记录恢复轮数并禁止受伤球员进入阵容', async () => {
     });
     return matches;
   });
-  await playRound(game, service);
+  const [result] = await playRound(game, service);
   assert.equal(statusFor(game, injuredPlayer).injury, '腿筋拉伤');
   assert.equal(statusFor(game, injuredPlayer).injuryMatches, 3);
   assert.equal(availabilityFor(game, injuredPlayer).type, 'injured');
+  const injuredStats = result.report.playerStats.find(item => item.playerId === injuredPlayer);
+  assert.equal(injuredStats.minutes, 48);
+  injuredStats.minutes = 90;
+  migrateGame(game);
+  assert.equal(injuredStats.minutes, 48);
   const club = game.teams.find(team => team.squad.includes(injuredPlayer));
   assert.throws(() => setLineup(game, club, club.formation, club.mentality, club.assignments), /伤病/);
+});
+
+test('红牌发生后会校验并截断球员出场时间', async () => {
+  const game = completeDraft(createGame('红牌时间', '玩家', {seed: 429}));
+  let dismissedPlayer;
+  const service = createFakeMatchService(matches => {
+    const match = matches[0];
+    const rating = match.playerRatings.find(item => item.redCards === 1);
+    dismissedPlayer = rating.playerId;
+    match.events.push({
+      minute: 36,
+      type: 'red_card',
+      teamId: rating.teamId,
+      playerId: rating.playerId,
+      description: '阻止明显得分机会被直接罚下'
+    });
+    return matches;
+  });
+  const [result] = await playRound(game, service);
+  const redEvent = result.report.events.find(event => event.type === 'red_card' && event.playerId === dismissedPlayer);
+  const stats = result.report.playerStats.find(item => item.playerId === dismissedPlayer);
+  assert.equal(redEvent.minute, 36);
+  assert.equal(stats.minutes, 36);
+  assert.equal(stats.redCards, 1);
+  assert.ok(!result.report.events.some(event => event.playerId === dismissedPlayer
+    && event.minute > 36 && !['substitution'].includes(event.type)));
+  stats.minutes = 90;
+  migrateGame(game);
+  assert.equal(stats.minutes, 36);
 });
 
 test('AI会生成赛前比赛计划和临场战术调整', async () => {
@@ -643,6 +702,9 @@ test('完整赛季数据累计出场、射门、传球、纪律和球队统计',
 test('战术校验并完成动态轮数联赛', async () => {
   const game = completeDraft(createGame('测试', '玩家', {seed: 2}));
   const team = game.teams[0];
+  const duplicated = team.assignments.map(assignment => ({...assignment}));
+  duplicated[1].playerId = duplicated[0].playerId;
+  assert.throws(() => setLineup(game, team, team.formation, team.mentality, duplicated), /不同球员/);
   setLineup(game, team, team.formation, '积极', team.assignments);
   assert.equal(team.mentality, '积极');
   while (game.phase === 'season') await playRound(game, createFakeMatchService());
@@ -662,9 +724,11 @@ test('自定义阵型可保存自由坐标并继续参与职责与比赛计算',
   ].map(([x, y]) => ({x, y}));
   const slots = normalizeCustomFormation(coordinates, game.rules.starters);
   const previous = [...team.assignments];
+  const promotedSubstitute = team.squad.find(playerId => !previous.some(assignment => assignment.playerId === playerId));
+  const replacedStarter = previous[10].playerId;
   const assignments = slots.map((slot, index) => ({
     slotId: slot.id,
-    playerId: previous[index].playerId,
+    playerId: index === 10 ? promotedSubstitute : previous[index].playerId,
     inRole: game.rules.inRoles[slot.group][0],
     outRole: game.rules.outRoles[slot.group][0]
   }));
@@ -674,6 +738,8 @@ test('自定义阵型可保存自由坐标并继续参与职责与比赛计算',
   assert.equal(team.customFormation[0].group, 'GK');
   assert.ok(team.customFormation.some(slot => slot.group === 'W'));
   assert.ok(team.customFormation.every(slot => slot.x >= 6 && slot.x <= 94 && slot.y >= 8 && slot.y <= 92));
+  assert.ok(team.starters.includes(promotedSubstitute));
+  assert.ok(!team.starters.includes(replacedStarter));
   assert.equal(publicGame(game).teams[0].customFormation[9].x, 48);
   await playRound(game, createFakeMatchService());
   assert.equal(game.currentRound, 1);
@@ -753,90 +819,212 @@ test('存档排除静态球员库并使用备份恢复', t => {
   assert.equal(recovered.SAVE01.players.length, 360);
 });
 
+test('账号在服务重启后仍可登录且磁盘中不保存明文密码', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lfm-auth-'));
+  t.after(() => fs.rmSync(directory, {recursive: true, force: true}));
+  const file = path.join(directory, 'auth.json');
+  const firstService = createAuthService({file});
+  firstService.register('persistent_user', ACCOUNT_PASSWORD);
+  assert.ok(fs.existsSync(file));
+  assert.ok(!fs.readFileSync(file, 'utf8').includes(ACCOUNT_PASSWORD));
+
+  const restartedService = createAuthService({file});
+  const loggedIn = restartedService.login('persistent_user', ACCOUNT_PASSWORD);
+  assert.equal(loggedIn.user.username, 'persistent_user');
+});
+
+test('朋友访问密钥在最外层拦截账号与房间接口', async () => {
+  const accessKey = 'friends-only-2026';
+  const auth = createAuthService();
+  const siteGate = createSiteGate(accessKey);
+  const handler = createRequestHandler({
+    games: {},
+    save: () => {},
+    publicDirectory: path.join(__dirname, '..', 'public'),
+    auth,
+    siteGate
+  });
+
+  const status = await callHandler(handler, 'GET', '/api/gate/status');
+  assert.deepEqual(status.body, {configured: true, unlocked: false});
+  const blocked = await callHandler(handler, 'POST', '/api/auth/register', {username: 'blocked_user', password: ACCOUNT_PASSWORD});
+  assert.equal(blocked.status, 403);
+  const wrong = await callHandler(handler, 'POST', '/api/gate/unlock', {accessKey: 'wrong-key'});
+  assert.equal(wrong.status, 401);
+
+  const unlocked = await callHandler(handler, 'POST', '/api/gate/unlock', {accessKey}, {'x-forwarded-proto': 'https'});
+  assert.equal(unlocked.status, 200);
+  assert.equal(unlocked.body.unlocked, true);
+  assert.match(unlocked.headers['set-cookie'], /lfm_site_access=/);
+  assert.match(unlocked.headers['set-cookie'], /HttpOnly/);
+  assert.match(unlocked.headers['set-cookie'], /Secure/);
+  assert.ok(!unlocked.headers['set-cookie'].includes(accessKey));
+  const gateCookie = responseCookie(unlocked);
+
+  const registered = await callHandler(handler, 'POST', '/api/auth/register', {
+    username: 'invited_user',
+    password: ACCOUNT_PASSWORD
+  }, {cookie: gateCookie});
+  assert.equal(registered.status, 201);
+  const verifiedStatus = await callHandler(handler, 'GET', '/api/gate/status', undefined, {cookie: gateCookie});
+  assert.deepEqual(verifiedStatus.body, {configured: true, unlocked: true});
+
+  let rateLimited;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    rateLimited = await callHandler(handler, 'POST', '/api/gate/unlock', {accessKey: 'still-wrong'}, {'x-forwarded-for': '203.0.113.8'});
+  }
+  assert.equal(rateLimited.status, 429);
+  const blockedCorrectKey = await callHandler(handler, 'POST', '/api/gate/unlock', {accessKey}, {'x-forwarded-for': '203.0.113.8'});
+  assert.equal(blockedCorrectKey.status, 429);
+
+  const changedKeyHandler = createRequestHandler({
+    games: {},
+    save: () => {},
+    publicDirectory: path.join(__dirname, '..', 'public'),
+    auth,
+    siteGate: createSiteGate('different-friends-key')
+  });
+  const expired = await callHandler(changedKeyHandler, 'GET', '/api/auth/session', undefined, {cookie: gateCookie});
+  assert.equal(expired.status, 403);
+});
+
+test('未配置朋友访问密钥时网站保持关闭', async () => {
+  const handler = createRequestHandler({
+    games: {},
+    save: () => {},
+    publicDirectory: path.join(__dirname, '..', 'public'),
+    siteGate: createSiteGate('')
+  });
+  const status = await callHandler(handler, 'GET', '/api/gate/status');
+  assert.deepEqual(status.body, {configured: false, unlocked: false});
+  const blocked = await callHandler(handler, 'POST', '/api/auth/login', {username: 'someone', password: ACCOUNT_PASSWORD});
+  assert.equal(blocked.status, 503);
+});
+
 test('API严格区分GET查询与POST操作', async () => {
   const games = {};
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
   let saves = 0;
-  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public')});
-  const created = await callHandler(handler, 'POST', '/api/games', {name: '接口测试', host: '房主'});
+  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '接口测试', host: '房主'}, accountHeaders(host));
   assert.equal(created.status, 201);
   const id = created.body.id;
   assert.equal(saves, 1);
-  const fetched = await callHandler(handler, 'GET', `/api/games/${id}`);
+  const fetched = await callHandler(handler, 'GET', `/api/games/${id}`, undefined, accountHeaders(host));
   assert.equal(fetched.status, 200);
-  const illegalMutation = await callHandler(handler, 'GET', `/api/games/${id}/start-draft`);
+  const illegalMutation = await callHandler(handler, 'GET', `/api/games/${id}/start-draft`, undefined, accountHeaders(host));
   assert.equal(illegalMutation.status, 405);
   assert.equal(games[id].phase, 'lobby');
-  const wrongNamespace = await callHandler(handler, 'GET', `/api/anything/${id}`);
+  const wrongNamespace = await callHandler(handler, 'GET', `/api/anything/${id}`, undefined, accountHeaders(host));
   assert.equal(wrongNamespace.status, 404);
-  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
-    'x-game-token': created.body.session.token,
+  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, accountHeaders(host, {
     'x-game-version': String(created.body.revision)
-  });
+  }));
   assert.equal(started.status, 200);
   assert.equal(games[id].phase, 'draft');
   assert.equal(saves, 2);
 });
 
+test('登录后才能进入游戏且同一账号可在多个浏览器恢复权限', async () => {
+  const games = {};
+  const auth = createAuthService();
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const blocked = await callHandler(handler, 'POST', '/api/games', {name: '未登录房间', host: '房主'});
+  assert.equal(blocked.status, 401);
+
+  const registered = await callHandler(handler, 'POST', '/api/auth/register', {username: 'same_user', password: ACCOUNT_PASSWORD});
+  assert.equal(registered.status, 201);
+  assert.match(registered.headers['set-cookie'], /HttpOnly/);
+  assert.match(registered.headers['set-cookie'], /SameSite=Lax/);
+  const firstBrowser = responseCookie(registered);
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '账号房间', host: '房主'}, {cookie: firstBrowser});
+  assert.equal(created.status, 201);
+  const id = created.body.id;
+  assert.equal(created.body.session.role, 'host');
+  assert.equal(created.body.session.token, undefined);
+  assert.ok(!JSON.stringify(auth.state).includes(ACCOUNT_PASSWORD));
+
+  const loggedInAgain = await callHandler(handler, 'POST', '/api/auth/login', {username: 'same_user', password: ACCOUNT_PASSWORD});
+  assert.equal(loggedInAgain.status, 200);
+  const secondBrowser = responseCookie(loggedInAgain);
+  assert.notEqual(secondBrowser, firstBrowser);
+  const restored = await callHandler(handler, 'GET', `/api/games/${id}`, undefined, {cookie: secondBrowser});
+  assert.equal(restored.status, 200);
+  assert.deepEqual(restored.body.session, created.body.session);
+
+  await callHandler(handler, 'POST', '/api/auth/logout', undefined, {cookie: firstBrowser});
+  const firstExpired = await callHandler(handler, 'GET', '/api/auth/session', undefined, {cookie: firstBrowser});
+  assert.equal(firstExpired.status, 401);
+  const secondStillValid = await callHandler(handler, 'GET', '/api/auth/session', undefined, {cookie: secondBrowser});
+  assert.equal(secondStillValid.status, 200);
+});
+
 test('真人玩家可选择未被占用的球队加入房间', async () => {
   const games = {};
-  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public')});
-  const created = await callHandler(handler, 'POST', '/api/games', {name: '选队房间', host: '房主', teamId: 't8'});
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
+  const guest = createTestAccount(auth);
+  const third = createTestAccount(auth);
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '选队房间', host: '房主', teamId: 't8'}, accountHeaders(host));
   const id = created.body.id;
   assert.equal(games[id].teams.find(team => team.id === 't8').controller, 'human');
-  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第二玩家', teamId: 't3'}, {
-    'x-game-version': String(created.body.revision)
-  });
+  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第二玩家', teamId: 't3'}, accountHeaders(guest, {
+    'x-game-version': String(created.body.revision),
+  }));
   assert.equal(joined.status, 200);
   assert.equal(joined.body.session.role, 'manager');
-  assert.ok(joined.body.session.token);
+  assert.equal(joined.body.session.token, undefined);
   assert.equal(games[id].teams.find(team => team.id === 't3').manager, '第二玩家');
-  const occupied = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第三玩家', teamId: 't3'}, {
-    'x-game-version': String(joined.body.revision)
-  });
+  const occupied = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '第三玩家', teamId: 't3'}, accountHeaders(third, {
+    'x-game-version': String(joined.body.revision),
+  }));
   assert.equal(occupied.status, 400);
   assert.match(occupied.body.error, /不可用/);
 });
 
 test('多人权限隔离并拒绝过期版本写入', async () => {
   const games = {};
-  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public')});
-  const created = await callHandler(handler, 'POST', '/api/games', {name: '权限房间', host: '房主'});
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
+  const manager = createTestAccount(auth);
+  const spectator = createTestAccount(auth);
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '权限房间', host: '房主'}, accountHeaders(host));
   const id = created.body.id;
-  const hostToken = created.body.session.token;
-  const unauthorised = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
+  const unauthorised = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, accountHeaders(spectator, {
     'x-game-version': String(created.body.revision)
-  });
-  assert.equal(unauthorised.status, 401);
-  const stale = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
-    'x-game-token': hostToken,
+  }));
+  assert.equal(unauthorised.status, 403);
+  const stale = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, accountHeaders(host, {
     'x-game-version': String(created.body.revision + 1)
-  });
+  }));
   assert.equal(stale.status, 409);
 
-  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '客队经理', teamId: 't3'}, {
-    'x-game-version': String(created.body.revision)
-  });
-  const managerToken = joined.body.session.token;
-  const managerStart = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
-    'x-game-token': managerToken,
+  const joined = await callHandler(handler, 'POST', `/api/games/${id}/join`, {manager: '客队经理', teamId: 't3'}, accountHeaders(manager, {
+    'x-game-version': String(created.body.revision),
+  }));
+  const managerStart = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, accountHeaders(manager, {
     'x-game-version': String(joined.body.revision)
-  });
+  }));
   assert.equal(managerStart.status, 403);
-  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, {
-    'x-game-token': hostToken,
+  const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, accountHeaders(host, {
     'x-game-version': String(joined.body.revision)
-  });
+  }));
   assert.equal(started.status, 200);
   const forbiddenPick = await callHandler(handler, 'POST', `/api/games/${id}/pick`, {
     teamId: 't1',
     playerId: started.body.availablePlayers[0].id
-  }, {'x-game-token': managerToken, 'x-game-version': String(started.body.revision)});
+  }, accountHeaders(manager, {'x-game-version': String(started.body.revision)}));
   assert.equal(forbiddenPick.status, 403);
 });
 
 test('同一房间只允许一个比赛模拟任务运行', async () => {
   const game = completeDraft(createGame('并发测试', '房主', {id: 'LOCK01', seed: 426}));
-  const session = createHostAccess(game, 't1');
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
+  createHostOwnership(game, 't1', host.user.id);
   const games = {[game.id]: game};
   const base = createFakeMatchService();
   let release;
@@ -848,8 +1036,8 @@ test('同一房间只允许一个比赛模拟任务运行', async () => {
       return base.simulateRound(current, round);
     }
   };
-  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: delayed});
-  const headers = {'x-game-token': session.token, 'x-game-version': String(game.revision)};
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: delayed, auth});
+  const headers = accountHeaders(host, {'x-game-version': String(game.revision)});
   const first = callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, headers);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(typeof release, 'function');
@@ -864,11 +1052,13 @@ test('同一房间只允许一个比赛模拟任务运行', async () => {
 
 test('删除房间必须使用DELETE并准确确认房间码', async () => {
   const games = {};
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
   let saves = 0;
-  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public')});
-  const created = await callHandler(handler, 'POST', '/api/games', {name: '待删除房间', host: '房主'});
+  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '待删除房间', host: '房主'}, accountHeaders(host));
   const id = created.body.id;
-  const permissionHeaders = {'x-game-token': created.body.session.token, 'x-game-version': String(created.body.revision)};
+  const permissionHeaders = accountHeaders(host, {'x-game-version': String(created.body.revision)});
   const wrongConfirmation = await callHandler(handler, 'DELETE', `/api/games/${id}`, {confirmCode: 'WRONG1'}, permissionHeaders);
   assert.equal(wrongConfirmation.status, 400);
   assert.ok(games[id]);
@@ -883,13 +1073,14 @@ test('删除房间必须使用DELETE并准确确认房间码', async () => {
 test('未配置DeepSeek密钥时API拒绝模拟且不推进轮次', async () => {
   const game = completeDraft(createGame('缺少密钥', '玩家', {id: 'NOKEY1'}));
   const games = {[game.id]: game};
-  const session = createHostAccess(game, 't1');
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
+  createHostOwnership(game, 't1', host.user.id);
   let saves = 0;
-  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public')});
-  const response = await callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, {
-    'x-game-token': session.token,
+  const handler = createRequestHandler({games, save: () => { saves++; }, publicDirectory: path.join(__dirname, '..', 'public'), auth});
+  const response = await callHandler(handler, 'POST', `/api/games/${game.id}/play-round`, {}, accountHeaders(host, {
     'x-game-version': String(game.revision)
-  });
+  }));
   assert.equal(response.status, 400);
   assert.match(response.body.error, /DEEPSEEK_API_KEY/);
   assert.equal(game.currentRound, 0);
@@ -899,12 +1090,13 @@ test('未配置DeepSeek密钥时API拒绝模拟且不推进轮次', async () => 
 
 test('API可以完成选秀、自动排阵和整季模拟', async () => {
   const games = {};
-  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: createFakeMatchService()});
-  const created = await callHandler(handler, 'POST', '/api/games', {name: '完整流程', host: '房主'});
+  const auth = createAuthService();
+  const host = createTestAccount(auth);
+  const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), matchService: createFakeMatchService(), auth});
+  const created = await callHandler(handler, 'POST', '/api/games', {name: '完整流程', host: '房主'}, accountHeaders(host));
   const id = created.body.id;
-  const token = created.body.session.token;
   let revision = created.body.revision;
-  const mutationHeaders = () => ({'x-game-token': token, 'x-game-version': String(revision)});
+  const mutationHeaders = () => accountHeaders(host, {'x-game-version': String(revision)});
   const started = await callHandler(handler, 'POST', `/api/games/${id}/start-draft`, {}, mutationHeaders());
   assert.equal(started.status, 200);
   revision = started.body.revision;

@@ -3,7 +3,7 @@ const {autoLineup} = require('./lineup');
 const {matchPlanFor} = require('./ai-manager');
 const {availabilityFor, isPlayerAvailable, settleRoundStatuses, snapshotUnavailable} = require('./season');
 
-const EVENT_TYPES = new Set(['goal', 'big_chance_missed', 'key_pass', 'key_save', 'substitution', 'injury', 'tactical_change']);
+const EVENT_TYPES = new Set(['goal', 'big_chance_missed', 'key_pass', 'key_save', 'substitution', 'injury', 'red_card', 'tactical_change']);
 
 function requiredText(value, field, maximumLength) {
   const text = String(value || '').trim();
@@ -47,11 +47,12 @@ function eventDescription(type) {
     key_save: '门将完成一次关键扑救',
     substitution: '球队完成换人调整',
     injury: '球员因伤无法继续坚持',
+    red_card: '球员被红牌罚下',
     tactical_change: '主教练根据场上局势调整了战术'
   }[type];
 }
 
-function validatedEvents(rawEvents, participants, resultScore, lineups, benches, aiTeamIds) {
+function validatedEvents(rawEvents, participants, resultScore, lineups, benches, aiTeamIds, rawRatings) {
   const events = (Array.isArray(rawEvents) ? rawEvents : []).flatMap((event, index) => {
     if (!EVENT_TYPES.has(event.type)) return [];
     if (event.type === 'tactical_change') {
@@ -138,7 +139,30 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches,
     ...lineups.away.map(entry => [entry.playerId, 1]),
     ...substitutions.map(event => [event.relatedPlayerId, event.minute])
   ]);
+  const exitBeforeDismissal = playerId => [...substitutions, ...events.filter(event => event.type === 'injury')]
+    .filter(event => event.playerId === playerId)
+    .reduce((minimum, event) => Math.min(minimum, event.minute), 90);
+  const dismissals = [];
+  for (const event of events.filter(item => item.type === 'red_card').sort((left, right) => left.minute - right.minute)) {
+    if (dismissals.some(item => item.playerId === event.playerId)) continue;
+    const entered = entryMinute.get(event.playerId);
+    if (!entered) continue;
+    dismissals.push({...event, minute: Math.max(entered, Math.min(event.minute, exitBeforeDismissal(event.playerId) - 1))});
+  }
+  for (const item of Array.isArray(rawRatings) ? rawRatings : []) {
+    if (!(Number(item.redCards) > 0) || !participants.has(item.playerId)
+      || dismissals.some(event => event.playerId === item.playerId)) continue;
+    const entered = entryMinute.get(item.playerId);
+    if (!entered) continue;
+    const requested = Math.min(89, Math.max(entered + 5, statistic(item.redCardMinute, 72, 1, 89)));
+    dismissals.push(generatedEvent('red_card', participants.get(item.playerId), item.playerId,
+      Math.max(entered, Math.min(requested, exitBeforeDismissal(item.playerId) - 1))));
+  }
   const exitMinute = new Map(substitutions.map(event => [event.playerId, event.minute]));
+  for (const event of [...events.filter(item => item.type === 'injury'), ...dismissals]) {
+    if (!entryMinute.has(event.playerId)) continue;
+    exitMinute.set(event.playerId, Math.min(exitMinute.get(event.playerId) || 90, event.minute));
+  }
   const activeAt = (playerId, minute) => entryMinute.has(playerId)
     && minute >= entryMinute.get(playerId)
     && minute <= (exitMinute.get(playerId) || 90);
@@ -148,12 +172,13 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches,
     while (teamGoals.length < expected) {
       const number = teamGoals.length;
       const minute = 10 + Math.floor((number + 1) * 75 / (expected + 1));
-      teamGoals.push(generatedEvent('goal', teamId, playerAt(starterPlayers(teamId), -1 - number % 3), minute));
+      const activeStarters = starterPlayers(teamId).filter(playerId => activeAt(playerId, minute));
+      teamGoals.push(generatedEvent('goal', teamId, playerAt(activeStarters.length ? activeStarters : starterPlayers(teamId), -1 - number % 3), minute));
     }
     goals.push(...teamGoals);
   }
 
-  let highlights = events.filter(event => !['goal', 'substitution', 'tactical_change'].includes(event.type) && activeAt(event.playerId, event.minute)).sort((left, right) => left.minute - right.minute);
+  let highlights = events.filter(event => !['goal', 'substitution', 'red_card', 'tactical_change'].includes(event.type) && activeAt(event.playerId, event.minute)).sort((left, right) => left.minute - right.minute);
   const required = [
     ['key_pass', resultScore.homeId, -4, 16],
     ['big_chance_missed', resultScore.awayId, -1, 34],
@@ -168,7 +193,7 @@ function validatedEvents(rawEvents, participants, resultScore, lineups, benches,
     highlights = [...selected, ...highlights.filter(event => !selected.includes(event))].slice(0, 9);
   }
 
-  return [...goals, ...highlights, ...substitutions, ...tacticalChanges]
+  return [...goals, ...highlights, ...substitutions, ...dismissals.filter(event => activeAt(event.playerId, event.minute)), ...tacticalChanges]
     .map(event => event.type === 'substitution' || !event.relatedPlayerId || activeAt(event.relatedPlayerId, event.minute)
       ? event
       : Object.fromEntries(Object.entries(event).filter(([key]) => key !== 'relatedPlayerId')))
@@ -263,6 +288,8 @@ function shotPriority(slotId) {
 
 function buildPlayerStats(events, ratings, lineups, rawRatings, teamStats, resultScore) {
   const starterIds = new Set([...lineups.home, ...lineups.away].map(entry => entry.playerId));
+  const substituteEntryMinutes = new Map(events.filter(event => event.type === 'substitution')
+    .map(event => [event.relatedPlayerId, event.minute]));
   const rawByPlayer = new Map((Array.isArray(rawRatings) ? rawRatings : []).filter(item => item && typeof item === 'object').map(item => [item.playerId, item]));
   const slots = new Map(ratings.map(item => [item.playerId, item.slotId]));
   const stats = new Map(ratings.map(item => [item.playerId, {
@@ -293,6 +320,15 @@ function buildPlayerStats(events, ratings, lineups, rawRatings, teamStats, resul
     } else if (event.type === 'key_pass' && actor) actor.keyPasses++;
     else if (event.type === 'big_chance_missed' && actor) actor.bigChancesMissed++;
     else if (event.type === 'key_save' && actor) actor.saves++;
+    else if (event.type === 'red_card' && actor) actor.redCards = 1;
+  }
+  for (const event of events.filter(item => ['injury', 'red_card'].includes(item.type))) {
+    const actor = stats.get(event.playerId);
+    if (!actor) continue;
+    const played = starterIds.has(event.playerId)
+      ? event.minute
+      : Math.max(0, event.minute - (substituteEntryMinutes.get(event.playerId) || event.minute));
+    actor.minutes = Math.min(actor.minutes, played);
   }
   for (const item of stats.values()) {
     const source = rawByPlayer.get(item.playerId) || {};
@@ -305,7 +341,7 @@ function buildPlayerStats(events, ratings, lineups, rawRatings, teamStats, resul
     const side = item.teamId === resultScore.homeId ? 'home' : 'away';
     item.passesCompleted = statistic(source.passesCompleted, Math.round(item.passes * teamStats[side].passAccuracy / 100), 0, item.passes);
     item.yellowCards = statistic(source.yellowCards, 0, 0, 2);
-    item.redCards = statistic(source.redCards, 0, 0, 1);
+    item.redCards = Math.max(item.redCards, statistic(source.redCards, 0, 0, 1));
   }
 
   for (const [side, teamId] of [['home', resultScore.homeId], ['away', resultScore.awayId]]) {
@@ -351,7 +387,7 @@ function validatedMatch(game, fixture, round, raw, model) {
   if (participants.size !== lineups.home.length + lineups.away.length + benches.home.length + benches.away.length) throw new Error('双方比赛名单存在重复球员');
   const resultScore = {homeId: home.id, awayId: away.id, homeGoals, awayGoals};
   const aiTeamIds = new Set([home, away].filter(team => team.controller === 'AI').map(team => team.id));
-  const events = validatedEvents(raw.events, participants, resultScore, lineups, benches, aiTeamIds);
+  const events = validatedEvents(raw.events, participants, resultScore, lineups, benches, aiTeamIds, raw.playerRatings);
   const playerRatings = validatedRatings(raw.playerRatings, participants, lineups, events);
   const bestRating = Math.max(...playerRatings.map(item => item.rating));
   const requestedBest = playerRatings.find(item => item.playerId === raw.playerOfMatch);

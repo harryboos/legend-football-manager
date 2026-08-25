@@ -1,60 +1,66 @@
-const crypto = require('crypto');
-
-function tokenHash(token) {
-  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
-}
-
-function newToken() {
-  return crypto.randomBytes(24).toString('base64url');
-}
-
 function ensureAccess(game) {
   if (!game.access || typeof game.access !== 'object') {
     game.access = {
-      version: 1,
+      version: 3,
       legacyClaimRequired: true,
       hostTeamId: game.teams.find(team => team.controller === 'human')?.id || game.teams[0]?.id,
-      hostTokenHash: null,
-      teamTokenHashes: {}
+      hostUserId: null,
+      teamUserIds: {}
     };
   }
-  game.access.teamTokenHashes = game.access.teamTokenHashes || {};
+  game.access.hostTeamId = game.access.hostTeamId || game.teams.find(team => team.controller === 'human')?.id || game.teams[0]?.id;
+  game.access.teamUserIds = game.access.teamUserIds || {};
+  game.access.hostUserId = game.access.hostUserId || null;
+  delete game.access.hostTokenHash;
+  delete game.access.teamTokenHashes;
+  delete game.access.passwordSalt;
+  delete game.access.passwordHash;
   return game.access;
 }
 
-function createHostAccess(game, hostTeamId) {
-  const token = newToken();
-  game.access = {
-    version: 1,
-    legacyClaimRequired: false,
-    hostTeamId,
-    hostTokenHash: tokenHash(token),
-    teamTokenHashes: {[hostTeamId]: tokenHash(token)}
-  };
-  return {token, role: 'host', teamId: hostTeamId};
+function createHostOwnership(game, hostTeamId, userId) {
+  const access = ensureAccess(game);
+  access.version = 3;
+  access.legacyClaimRequired = false;
+  access.hostTeamId = hostTeamId;
+  access.hostUserId = userId;
+  access.teamUserIds = {[hostTeamId]: userId};
+  return {role: 'host', teamId: hostTeamId};
 }
 
-function issueTeamAccess(game, teamId) {
+function issueTeamOwnership(game, teamId, userId) {
   const access = ensureAccess(game);
-  const token = newToken();
-  access.teamTokenHashes[teamId] = tokenHash(token);
-  return {token, role: 'manager', teamId};
+  const existing = sessionForUser(game, userId);
+  if (existing) throw new Error('当前账号已经在此房间管理一支球队');
+  if (access.teamUserIds[teamId]) throw new Error('所选球队已经被其他账号占用');
+  access.version = 3;
+  access.teamUserIds[teamId] = userId;
+  return {role: 'manager', teamId};
 }
 
-function sessionForToken(game, token) {
+function sessionForUser(game, userId) {
   const access = ensureAccess(game);
-  if (!token) return null;
-  const hash = tokenHash(token);
-  if (access.hostTokenHash && hash === access.hostTokenHash) return {role: 'host', teamId: access.hostTeamId};
-  const teamId = Object.keys(access.teamTokenHashes).find(id => access.teamTokenHashes[id] === hash);
+  if (!userId) return null;
+  if (access.hostUserId === userId) return {role: 'host', teamId: access.hostTeamId};
+  const teamId = Object.keys(access.teamUserIds).find(id => access.teamUserIds[id] === userId);
   return teamId ? {role: 'manager', teamId} : null;
 }
 
-function claimLegacyHost(game, confirmCode) {
+function claimLegacyHost(game, confirmCode, userId) {
   const access = ensureAccess(game);
-  if (!access.legacyClaimRequired) throw new Error('该房间已经完成权限升级');
+  if (access.hostUserId) throw new Error('该房间已经绑定房主账号');
   if (String(confirmCode || '').trim().toUpperCase() !== game.id) throw new Error('房间码确认不匹配');
-  return createHostAccess(game, access.hostTeamId);
+  access.version = 3;
+  access.legacyClaimRequired = false;
+  access.hostUserId = userId;
+  access.teamUserIds[access.hostTeamId] = userId;
+  return {role: 'host', teamId: access.hostTeamId};
 }
 
-module.exports = {claimLegacyHost, createHostAccess, ensureAccess, issueTeamAccess, sessionForToken};
+module.exports = {
+  claimLegacyHost,
+  createHostOwnership,
+  ensureAccess,
+  issueTeamOwnership,
+  sessionForUser
+};
