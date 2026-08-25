@@ -25,7 +25,7 @@ const {createSiteGate} = require('../src/site-gate');
 const {createDeepSeekMatchService, DEEPSEEK_API_URL, DEEPSEEK_MODEL} = require('../src/match-ai');
 const {createHostOwnership} = require('../src/access');
 const {availabilityFor, buildSeasonStats, statusFor} = require('../src/season');
-const {currentDraftTeam, randomDraftOrder} = require('../src/draft');
+const {aiChoice, currentDraftTeam, randomDraftOrder} = require('../src/draft');
 const ACCOUNT_PASSWORD = 'legend-test-123';
 let accountSequence = 0;
 
@@ -33,7 +33,7 @@ function completeDraft(game) {
   game.phase = 'draft';
   runAiDraft(game);
   while (!game.draft.complete) {
-    draftPick(game, 't1', publicGame(game).availablePlayers[0].id);
+    draftPick(game, 't1', aiChoice(game, game.teams.find(team => team.id === 't1')).id);
     runAiDraft(game);
   }
   return game;
@@ -214,9 +214,14 @@ test('AI战术由房间种子决定且同种子结果稳定', () => {
 
 test('球员库包含360名不重名真实球员且位置结构平衡', () => {
   const game = createGame('测试', '玩家');
+  assert.equal(game.playerLibraryVersion, 3);
   assert.equal(game.players.length, 360);
   assert.equal(new Set(game.players.map(player => player.name)).size, 360);
   assert.ok(game.players.every(player => !/^国际球员/.test(player.name)));
+  assert.equal(game.players.filter(player => player.era === '传奇').length, 183);
+  assert.equal(game.players.filter(player => player.era === '现役·巅峰').length, 177);
+  assert.ok(game.players.every(player => ['传奇', '现役·巅峰'].includes(player.era)));
+  assert.ok(game.players.every(player => player.rating >= 86 && player.rating <= 99));
   const counts = {};
   game.players.forEach(player => {
     const group = groupForPosition(player.position);
@@ -239,6 +244,28 @@ test('球员库包含360名不重名真实球员且位置结构平衡', () => {
   assert.equal(maradona.positionFamiliarity.CB, 18);
   assert.equal(positionFit(maradona, {id: 'AM', group: 'AM'}), 1);
   assert.ok(positionFit(maradona, {id: 'CB', group: 'CB'}) < 0.4);
+  assert.deepEqual(
+    ['梅西', '德布劳内', '诺伊尔'].map(name => {
+      const candidate = game.players.find(player => player.name === name);
+      return [candidate.name, candidate.era, candidate.rating];
+    }),
+    [['梅西', '现役·巅峰', 99], ['德布劳内', '现役·巅峰', 95], ['诺伊尔', '现役·巅峰', 95]]
+  );
+  assert.equal(game.players.find(candidate => candidate.name === '贝利').rating, 99);
+});
+
+test('旧房间继续使用旧球员编号，新房间使用巅峰球星库', () => {
+  const current = createGame('新版球员库', '玩家', {seed: 20260826});
+  assert.equal(current.playerLibraryVersion, 3);
+  assert.equal(current.players.find(player => player.id === 'p1').name, '雅辛');
+
+  const legacy = createGame('旧版球员库', '玩家', {seed: 20260825});
+  delete legacy.playerLibraryVersion;
+  legacy.teams[0].squad = ['p1'];
+  migrateGame(legacy);
+  assert.equal(legacy.playerLibraryVersion, 2);
+  assert.equal(legacy.players.find(player => player.id === 'p1').name, '梅西');
+  assert.deepEqual(legacy.teams[0].squad, ['p1']);
 });
 
 test('真人选择后AI自动选到下一位真人或选秀结束', () => {

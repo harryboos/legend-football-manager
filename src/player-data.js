@@ -185,4 +185,4 @@ const RAW_PLAYERS = [...LEGACY_PLAYERS, ...activePlayers()];
 if (RAW_PLAYERS.length !== 360) throw new Error(`球员库应为 360 人，当前为 ${RAW_PLAYERS.length} 人`);
 if (new Set(RAW_PLAYERS.map(player => player[0])).size !== RAW_PLAYERS.length) throw new Error('球员库存在重名球员');
 
-module.exports = {RAW_PLAYERS};
+module.exports = {LEGACY_RAW_PLAYERS: RAW_PLAYERS, RAW_PLAYERS};

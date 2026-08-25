@@ -1,4 +1,5 @@
-const {RAW_PLAYERS} = require('./player-data');
+const {LEGACY_RAW_PLAYERS} = require('./player-data');
+const {CURATED_RAW_PLAYERS} = require('./curated-player-data');
 
 const ATTRIBUTE_LABELS = {
   technical: {finishing: '射门', passing: '传球', dribbling: '盘带', firstTouch: '停球', tackling: '抢断', marking: '盯人', heading: '头球', crossing: '传中'},
@@ -144,22 +145,27 @@ function categoryAverages(attributes) {
   }));
 }
 
-const PLAYERS = RAW_PLAYERS.map(([name, era, positions, rating], index) => {
-  const attributes = makeAttributes(name, rating, positions);
-  const body = makeBodyProfile(name, positions);
-  return {
-    id: `p${index + 1}`,
-    name,
-    era,
-    position: positions[0],
-    positions,
-    positionFamiliarity: makePositionFamiliarity(positions),
-    ...body,
-    rating,
-    attributes,
-    categoryAverages: categoryAverages(attributes)
-  };
-});
+function makePlayers(rawPlayers) {
+  return rawPlayers.map(([name, era, positions, rating], index) => {
+    const attributes = makeAttributes(name, rating, positions);
+    const body = makeBodyProfile(name, positions);
+    return {
+      id: `p${index + 1}`,
+      name,
+      era,
+      position: positions[0],
+      positions,
+      positionFamiliarity: makePositionFamiliarity(positions),
+      ...body,
+      rating,
+      attributes,
+      categoryAverages: categoryAverages(attributes)
+    };
+  });
+}
+
+const LEGACY_PLAYERS = makePlayers(LEGACY_RAW_PLAYERS);
+const PLAYERS = makePlayers(CURATED_RAW_PLAYERS);
 
 function positionFit(player, slot) {
   if (!player) return 0;
@@ -195,4 +201,4 @@ function roleScore(player, role, group) {
   return keys.reduce((sum, key) => sum + (player.attributes[key] || 1), 0) / keys.length;
 }
 
-module.exports = {PLAYERS, ATTRIBUTE_LABELS, POSITION_LABELS, groupForPosition, positionForSlot, positionFamiliarity, positionFit, roleScore};
+module.exports = {PLAYERS, LEGACY_PLAYERS, ATTRIBUTE_LABELS, POSITION_LABELS, groupForPosition, positionForSlot, positionFamiliarity, positionFit, roleScore};

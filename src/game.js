@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const {PLAYERS, ATTRIBUTE_LABELS, POSITION_LABELS, positionFit, roleScore} = require('./players');
+const {PLAYERS, LEGACY_PLAYERS, ATTRIBUTE_LABELS, POSITION_LABELS, positionFit, roleScore} = require('./players');
 const {CUSTOM_FORMATION, createRuleSnapshot, upgradeRuleSnapshot, rulesFor, formationSlots, normalizeCustomFormation} = require('./rules');
 const {createSchedule, rebalanceRemainingSchedule} = require('./schedule');
 const {availablePlayers, currentDraftTeam, randomDraftOrder, aiChoice, draftPick, runAiDraft} = require('./draft');
@@ -55,7 +55,7 @@ function createGame(name, host, options = {}) {
 
   return {
     schemaVersion: 3,
-    playerLibraryVersion: 2,
+    playerLibraryVersion: 3,
     aiManagerVersion: 2,
     id: options.id || crypto.randomBytes(4).toString('hex').slice(0, 6).toUpperCase(),
     name: name || '传奇经理联赛',
@@ -79,14 +79,17 @@ function createGame(name, host, options = {}) {
 }
 
 function migrateGame(game) {
-  const shouldRefreshLineups = game.playerLibraryVersion !== 2;
+  const sourcePlayerLibraryVersion = Number(game.playerLibraryVersion) || 2;
+  const playerLibraryVersion = sourcePlayerLibraryVersion >= 3 ? 3 : 2;
+  const playerLibrary = playerLibraryVersion === 3 ? PLAYERS : LEGACY_PLAYERS;
+  const shouldRefreshLineups = ![2, 3].includes(sourcePlayerLibraryVersion);
   const shouldUpgradeAiManagers = game.aiManagerVersion !== 2;
   const shouldRebuildStatuses = !game.playerStatuses || typeof game.playerStatuses !== 'object';
   game.schemaVersion = 3;
-  game.playerLibraryVersion = 2;
+  game.playerLibraryVersion = playerLibraryVersion;
   game.rules = upgradeRuleSnapshot(game.rules || createRuleSnapshot());
   const rules = rulesFor(game);
-  game.players = PLAYERS;
+  game.players = playerLibrary;
   game.seed = game.seed >>> 0 || seedFromText(game.id);
   game.rngState = game.rngState >>> 0 || game.seed;
   game.results = Array.isArray(game.results) ? game.results : [];
@@ -134,7 +137,7 @@ function migrateGame(game) {
       }
     } else if (!rules.formations[team.formation]) team.formation = fallbackFormation;
     team.mentality = rules.mentalities.includes(team.mentality) ? team.mentality : '平衡';
-    team.squad = Array.isArray(team.squad) ? team.squad.filter(id => PLAYERS.some(player => player.id === id)) : [];
+    team.squad = Array.isArray(team.squad) ? team.squad.filter(id => game.players.some(player => player.id === id)) : [];
   });
 
   if (['season', 'finished'].includes(game.phase) && game.teams.some(team => team.squad.length < rules.squadSize)) {
