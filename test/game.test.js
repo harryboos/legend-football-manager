@@ -953,7 +953,7 @@ test('API严格区分GET查询与POST操作', async () => {
   assert.equal(saves, 2);
 });
 
-test('登录后才能进入游戏且同一账号可在多个浏览器恢复权限', async () => {
+test('登录后才能进入联赛且同一账号可在多个浏览器恢复权限', async () => {
   const games = {};
   const auth = createAuthService();
   const handler = createRequestHandler({games, save: () => {}, publicDirectory: path.join(__dirname, '..', 'public'), auth});

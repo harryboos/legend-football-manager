@@ -203,7 +203,7 @@ function createApiHandler({games, save, matchService = {available: false, model:
       throw new HttpError(405, '此接口仅支持 GET 或 DELETE');
     }
 
-    if (request.method !== 'POST') throw new HttpError(405, '游戏操作仅支持 POST');
+    if (request.method !== 'POST') throw new HttpError(405, '相关操作仅支持 POST');
     const body = await readJsonBody(request);
     const action = parts[3];
 
@@ -351,7 +351,7 @@ function createRequestHandler({games, save, publicDirectory, matchService, auth 
         if (siteGate && !siteGate.verifyToken(cookieValue(request, SITE_GATE_COOKIE))) throw new HttpError(403, '请先输入朋友访问密钥');
         if (await handleAuthApi(auth, request, response, url.pathname)) return;
         const account = authenticatedAccount(auth, request);
-        if (!account) throw new HttpError(401, '请先登录后再进入游戏');
+        if (!account) throw new HttpError(401, '请先登录后再访问联赛');
         const handled = await handleApi(request, response, url.pathname, account);
         if (!handled) throw new HttpError(404, '接口不存在');
         return;

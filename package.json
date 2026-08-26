@@ -2,7 +2,7 @@
   "name": "legend-football-manager",
   "version": "1.0.0",
   "private": true,
-  "description": "20队多人足球经理网页游戏 MVP",
+  "description": "harryboos的个人足球经理项目",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",

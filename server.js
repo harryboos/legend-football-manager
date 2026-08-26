@@ -21,7 +21,7 @@ function createApplication(options = {}) {
 
 if (require.main === module) {
   const {server} = createApplication();
-  server.listen(cfg.PORT, () => console.log(`传奇足球经理已启动：http://localhost:${cfg.PORT}`));
+  server.listen(cfg.PORT, () => console.log(`harryboos的个人项目已启动：http://localhost:${cfg.PORT}`));
 }
 
 module.exports = {createApplication};
