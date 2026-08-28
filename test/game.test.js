@@ -22,7 +22,13 @@ const {createGameStore, persistentGame} = require('../src/storage');
 const {createRequestHandler} = require('../src/api');
 const {createAuthService} = require('../src/auth');
 const {createSiteGate} = require('../src/site-gate');
-const {createDeepSeekMatchService, DEEPSEEK_API_URL, DEEPSEEK_MODEL} = require('../src/match-ai');
+const {
+  createDeepSeekMatchService,
+  DEEPSEEK_API_URL,
+  DEEPSEEK_MODEL,
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_MAX_TOKENS
+} = require('../src/match-ai');
 const {createHostOwnership} = require('../src/access');
 const {availabilityFor, buildSeasonStats, statusFor} = require('../src/season');
 const {aiChoice, currentDraftTeam, randomDraftOrder} = require('../src/draft');
@@ -487,7 +493,7 @@ test('旧比赛自动补齐战报且不改变后续随机状态', async () => {
     && item.yellowCards === 0 && item.redCards === 0));
 });
 
-test('DeepSeek V4 Flash服务按两场一批并行调用JSON接口', async () => {
+test('DeepSeek V4 Flash使用紧凑协议并按五场一批调用JSON接口', async () => {
   const game = completeDraft(createGame('AI比赛', '玩家', {seed: 90}));
   const requests = [];
   const service = createDeepSeekMatchService({
@@ -495,35 +501,60 @@ test('DeepSeek V4 Flash服务按两场一批并行调用JSON接口', async () =>
     apiKey: 'test-key',
     fetchImpl: async (url, options) => {
       requests.push({url, options});
+      const body = JSON.parse(options.body);
+      const facts = JSON.parse(body.messages[1].content);
+      const matches = facts.f.map(fixture => {
+        const ratings = [...fixture.h.l, ...fixture.a.l].map(player => [player[0], 6.8, 0, 0, null]);
+        return {
+          h: fixture.h.i,
+          a: fixture.a.i,
+          g: [0, 0],
+          hl: '双方握手言和',
+          su: '双方围绕中场控制展开较量，防守结构都较为完整，虽然创造出了一些机会，但最终均未能完成破门。',
+          tn: '两队保持阵型完整，通过中场压迫限制了对手的推进空间。',
+          ts: [[50, 8, 2, 1, 3, 10, 82], [50, 7, 2, 1, 2, 11, 81]],
+          e: [],
+          r: ratings,
+          pom: ratings[0][0]
+        };
+      });
       return {
         ok: true,
         json: async () => ({
-          choices: [{message: {content: JSON.stringify({matches: [{}, {}]})}}]
+          choices: [{message: {content: JSON.stringify({matches})}}]
         })
       };
     }
   });
   const matches = await service.simulateRound(game, game.rounds[0]);
-  assert.equal(requests.length, 5);
+  assert.equal(DEFAULT_BATCH_SIZE, 5);
+  assert.equal(requests.length, 2);
   assert.equal(matches.length, 10);
+  assert.equal(matches[0].playerRatings.length, 22);
+  assert.ok(matches[0].playerRatings.every(item => item.teamId === matches[0].homeId || item.teamId === matches[0].awayId));
+  assert.deepEqual(Object.keys(matches[0].teamStats.home), ['possession', 'shots', 'shotsOnTarget', 'bigChances', 'corners', 'fouls', 'passAccuracy']);
+  assert.ok(requests.reduce((sum, request) => sum + request.options.body.length, 0) < 80_000);
   for (const request of requests) {
     const body = JSON.parse(request.options.body);
+    const facts = JSON.parse(body.messages[1].content);
     assert.equal(request.url, DEEPSEEK_API_URL);
     assert.equal(request.options.headers.authorization, 'Bearer test-key');
     assert.equal(body.model, 'deepseek-v4-flash');
     assert.equal(body.response_format.type, 'json_object');
     assert.equal(body.thinking.type, 'disabled');
-    assert.equal(body.max_tokens, 12_000);
-    assert.ok(body.messages[0].content.includes('浪费'));
+    assert.equal(body.max_tokens, DEFAULT_MAX_TOKENS);
+    assert.ok(body.messages[0].content.includes('失机'));
     assert.ok(body.messages[0].content.includes('substitution'));
-    assert.ok(body.messages[0].content.includes('teamStats'));
-    assert.ok(body.messages[0].content.includes('passesCompleted'));
-    assert.ok(body.messages[0].content.includes('yellowCards'));
-    assert.ok(body.messages[0].content.includes('assignedFamiliarity'));
+    assert.ok(body.messages[0].content.includes('ts 每队'));
+    assert.ok(body.messages[0].content.includes('个人射门和传球由服务端'));
+    assert.ok(body.messages[0].content.includes('位置熟练度'));
     assert.ok(body.messages[0].content.includes('身高体重'));
-    assert.ok(body.messages[1].content.includes('"bench"'));
-    assert.ok(body.messages[1].content.includes('"heightCm"'));
-    assert.ok(body.messages[1].content.includes('"assignedFamiliarity"'));
+    assert.ok(Array.isArray(facts.f));
+    assert.ok(Array.isArray(facts.f[0].h.b));
+    assert.equal(facts.f[0].h.l[0].length, 11);
+    assert.equal(facts.f[0].h.l[0][10].length, 16);
+    assert.ok(!body.messages[1].content.includes('positionFamiliarity'));
+    assert.ok(!body.messages[1].content.includes('attributes'));
   }
 });
 
@@ -599,10 +630,9 @@ test('AI业务校验失败后只重跑坏掉的单场缓存', async () => {
     fetchImpl: async (url, options) => {
       calls++;
       const body = JSON.parse(options.body);
-      const content = body.messages[1].content;
-      const facts = JSON.parse(content.slice(content.indexOf('{')));
-      const matches = facts.fixtures.map(fixture => {
-        const fixtureIndex = round.games.findIndex(item => item.home === fixture.home.id && item.away === fixture.away.id);
+      const facts = JSON.parse(body.messages[1].content);
+      const matches = facts.f.map(fixture => {
+        const fixtureIndex = round.games.findIndex(item => item.home === fixture.h.i && item.away === fixture.a.i);
         const match = fakeMatch(game, round.games[fixtureIndex], round, fixtureIndex);
         if (injectInvalid && fixtureIndex === 0) match.headline = '';
         return match;
