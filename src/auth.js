@@ -1,8 +1,9 @@
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const {promisify} = require('util');
+const {createJsonStore} = require('./storage');
 
 const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const scrypt = promisify(crypto.scrypt);
 
 function emptyState() {
   return {version: 1, users: {}, sessions: {}};
@@ -10,6 +11,10 @@ function emptyState() {
 
 function passwordHash(password, salt) {
   return crypto.scryptSync(String(password), salt, 32).toString('hex');
+}
+
+async function passwordHashAsync(password, salt) {
+  return (await scrypt(String(password), salt, 32)).toString('hex');
 }
 
 function tokenHash(token) {
@@ -39,31 +44,29 @@ function publicUser(user) {
   return {id: user.id, username: user.username, createdAt: user.createdAt};
 }
 
-function createFileState(file) {
-  const backupFile = `${file}.bak`;
-  let state = emptyState();
-  if (fs.existsSync(file)) {
-    try {
-      state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch (error) {
-      if (!fs.existsSync(backupFile)) throw new Error(`账号数据读取失败：${error.message}`);
-      state = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
-    }
+function validateState(state) {
+  const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!isRecord(state) || !isRecord(state.users) || !isRecord(state.sessions)) throw new Error('账号数据结构无效');
+  const usernames = new Set();
+  for (const [id, user] of Object.entries(state.users)) {
+    if (!isRecord(user) || user.id !== id || typeof user.username !== 'string'
+      || user.usernameKey !== user.username.toLocaleLowerCase()
+      || typeof user.passwordSalt !== 'string' || !/^[a-f0-9]{32}$/i.test(user.passwordSalt)
+      || typeof user.passwordHash !== 'string' || !/^[a-f0-9]{64}$/i.test(user.passwordHash)
+      || usernames.has(user.usernameKey)) throw new Error('账号记录无效');
+    usernames.add(user.usernameKey);
   }
-  state.users = state.users && typeof state.users === 'object' ? state.users : {};
-  state.sessions = state.sessions && typeof state.sessions === 'object' ? state.sessions : {};
-  const save = () => {
-    fs.mkdirSync(path.dirname(file), {recursive: true});
-    const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      fs.writeFileSync(temporary, JSON.stringify(state, null, 2), 'utf8');
-      if (fs.existsSync(file)) fs.copyFileSync(file, backupFile);
-      fs.renameSync(temporary, file);
-    } finally {
-      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-    }
-  };
-  return {state, save};
+  for (const [hash, record] of Object.entries(state.sessions)) {
+    if (!/^[a-f0-9]{64}$/i.test(hash) || !isRecord(record)
+      || typeof record.userId !== 'string' || !Number.isFinite(record.expiresAt)) throw new Error('登录会话记录无效');
+  }
+  return state;
+}
+
+function createFileState(file) {
+  const store = createJsonStore(file, {empty: emptyState, validate: validateState, label: '账号数据'});
+  const state = store.load();
+  return {state, save: () => store.save(state)};
 }
 
 function createAuthService(options = {}) {
@@ -71,35 +74,70 @@ function createAuthService(options = {}) {
   const state = source.state;
   state.users = state.users || {};
   state.sessions = state.sessions || {};
+  validateState(state);
+  const usersByName = new Map(Object.values(state.users).map(user => [user.usernameKey, user.id]));
+
+  function save() {
+    try {
+      source.save();
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      failure.status = 500;
+      throw failure;
+    }
+  }
 
   function findUser(username) {
     const key = String(username || '').trim().toLocaleLowerCase();
-    return Object.values(state.users).find(user => user.usernameKey === key);
+    return state.users[usersByName.get(key)];
   }
 
-  function createSession(user) {
+  function createSession(user, newUser = false) {
     const token = crypto.randomBytes(32).toString('base64url');
-    state.sessions[tokenHash(token)] = {userId: user.id, expiresAt: Date.now() + SESSION_MAX_AGE_MS};
-    source.save();
+    const hash = tokenHash(token);
+    const now = Date.now();
+    const expired = Object.entries(state.sessions).filter(([, record]) => record.expiresAt <= now || !Object.hasOwn(state.users, record.userId));
+    for (const [key] of expired) delete state.sessions[key];
+    state.sessions[hash] = {userId: user.id, expiresAt: now + SESSION_MAX_AGE_MS};
+    if (newUser) state.users[user.id] = user;
+    try {
+      save();
+    } catch (error) {
+      delete state.sessions[hash];
+      for (const [key, record] of expired) state.sessions[key] = record;
+      if (newUser) delete state.users[user.id];
+      throw error;
+    }
+    if (newUser) usersByName.set(user.usernameKey, user.id);
     return {token, user: publicUser(user)};
   }
 
-  function register(usernameValue, passwordValue) {
+  function registration(usernameValue, passwordValue) {
     const username = normalizeUsername(usernameValue);
     const password = validatePassword(passwordValue);
     if (findUser(username)) throw new Error('用户名已经存在');
-    const id = crypto.randomBytes(12).toString('hex');
     const salt = crypto.randomBytes(16).toString('hex');
-    const user = {
-      id,
+    return {password, user: {
+      id: crypto.randomBytes(12).toString('hex'),
       username,
       usernameKey: username.toLocaleLowerCase(),
       passwordSalt: salt,
-      passwordHash: passwordHash(password, salt),
       createdAt: new Date().toISOString()
-    };
-    state.users[id] = user;
-    return createSession(user);
+    }};
+  }
+
+  function register(usernameValue, passwordValue) {
+    const {password, user} = registration(usernameValue, passwordValue);
+    user.passwordHash = passwordHash(password, user.passwordSalt);
+    return createSession(user, true);
+  }
+
+  async function registerAsync(usernameValue, passwordValue) {
+    const {password, user} = registration(usernameValue, passwordValue);
+    user.passwordHash = await passwordHashAsync(password, user.passwordSalt);
+    // Another registration may have finished while scrypt was running.
+    if (findUser(user.username)) throw new Error('用户名已经存在');
+    return createSession(user, true);
   }
 
   function login(usernameValue, passwordValue) {
@@ -110,13 +148,31 @@ function createAuthService(options = {}) {
     return createSession(user);
   }
 
+  async function loginAsync(usernameValue, passwordValue) {
+    const username = normalizeUsername(usernameValue);
+    const password = validatePassword(passwordValue);
+    const user = findUser(username);
+    if (!user || !safeEqual(user.passwordHash, await passwordHashAsync(password, user.passwordSalt))) throw new Error('用户名或密码错误');
+    return createSession(user);
+  }
+
+  function deleteSession(hash) {
+    const record = state.sessions[hash];
+    delete state.sessions[hash];
+    try {
+      save();
+    } catch (error) {
+      state.sessions[hash] = record;
+      throw error;
+    }
+  }
+
   function session(token) {
     const hash = tokenHash(token);
     const record = state.sessions[hash];
     if (!record) return null;
-    if (record.expiresAt <= Date.now()) {
-      delete state.sessions[hash];
-      source.save();
+    if (record.expiresAt <= Date.now() || !Object.hasOwn(state.users, record.userId)) {
+      deleteSession(hash);
       return null;
     }
     const user = state.users[record.userId];
@@ -126,12 +182,11 @@ function createAuthService(options = {}) {
   function logout(token) {
     const hash = tokenHash(token);
     if (state.sessions[hash]) {
-      delete state.sessions[hash];
-      source.save();
+      deleteSession(hash);
     }
   }
 
-  return {login, logout, register, session, state};
+  return {login, loginAsync, logout, register, registerAsync, session, state};
 }
 
 module.exports = {SESSION_MAX_AGE_MS, createAuthService};

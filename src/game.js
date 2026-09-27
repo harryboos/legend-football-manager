@@ -117,6 +117,7 @@ function migrateGame(game) {
   }
 
   const fallbackFormation = Object.keys(rules.formations)[0];
+  const playerIds = new Set(game.players.map(player => player.id));
   game.teams.forEach((team, index) => {
     const profile = team.aiProfile ? profileForTeam(team) : profileForIndex(index, game.seed);
     team.aiProfile = profile.id;
@@ -137,7 +138,7 @@ function migrateGame(game) {
       }
     } else if (!rules.formations[team.formation]) team.formation = fallbackFormation;
     team.mentality = rules.mentalities.includes(team.mentality) ? team.mentality : '平衡';
-    team.squad = Array.isArray(team.squad) ? team.squad.filter(id => game.players.some(player => player.id === id)) : [];
+    team.squad = Array.isArray(team.squad) ? [...new Set(team.squad)].filter(id => playerIds.has(id)) : [];
   });
 
   if (['season', 'finished'].includes(game.phase) && game.teams.some(team => team.squad.length < rules.squadSize)) {
@@ -174,9 +175,10 @@ function publicGame(game) {
   const rules = rulesFor(game);
   const {rules: storedRules, rngState, access, aiSimulationCache, ...state} = game;
   const season = buildSeasonStats(game);
+  const playersById = new Map(game.players.map(player => [player.id, player]));
   const topScorers = Object.entries(game.scorers)
     .map(([id, goals]) => {
-      const player = game.players.find(candidate => candidate.id === id);
+      const player = playersById.get(id);
       return player ? {...player, goals} : null;
     })
     .filter(Boolean)

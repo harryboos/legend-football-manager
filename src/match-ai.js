@@ -1,4 +1,5 @@
 const {teamMetrics} = require('./lineup');
+const {createHash} = require('crypto');
 const {formationSlots} = require('./rules');
 const {positionForSlot, positionFamiliarity} = require('./players');
 const {availabilityFor} = require('./season');
@@ -20,11 +21,12 @@ function attributeVector(player) {
   return [...MATCH_ATTRIBUTE_KEYS.map(key => player.attributes[key]), Math.round(goalkeeping)];
 }
 
-function lineupFacts(game, team) {
+function lineupFacts(game, team, playersById) {
   const slots = new Map(formationSlots(game, team.formation, team.customFormation).map(slot => [slot.id, slot]));
   return (team.assignments || []).map(assignment => {
-    const player = game.players.find(candidate => candidate.id === assignment.playerId);
+    const player = playersById.get(assignment.playerId);
     const slot = slots.get(assignment.slotId);
+    if (!player || !slot) throw new Error(`${team.name} 的首发球员或阵型位置无效`);
     return [
       player.id, player.name, assignment.slotId, positionForSlot(slot), positionFamiliarity(player, slot),
       player.heightCm, player.weightKg, player.rating, assignment.inRole, assignment.outRole, attributeVector(player)
@@ -32,15 +34,17 @@ function lineupFacts(game, team) {
   });
 }
 
-function benchFacts(game, team) {
+function benchFacts(game, team, playersById) {
   const starters = new Set((team.assignments || []).map(assignment => assignment.playerId));
   return (team.squad || []).filter(id => !starters.has(id) && availabilityFor(game, id).available).map(id => {
-    const player = game.players.find(candidate => candidate.id === id);
+    const player = playersById.get(id);
+    if (!player) throw new Error(`${team.name} 的替补球员无效`);
     return [player.id, player.name, player.positions, player.heightCm, player.weightKg, player.rating, attributeVector(player)];
   });
 }
 
-function teamFacts(game, team) {
+function teamFacts(game, team, playersById) {
+  if (!team) throw new Error('比赛球队不存在');
   const metrics = teamMetrics(game, team);
   const plan = team.matchPlan
     ? [team.matchPlan.formation, team.matchPlan.mentality, team.matchPlan.style]
@@ -56,17 +60,19 @@ function teamFacts(game, team) {
       .map(slot => [slot.id, slot.group, Math.round(Number(slot.x) || 50), Math.round(Number(slot.y) || 50)]),
     m: team.mentality,
     met: METRIC_KEYS.map(key => Number(metrics[key].toFixed(2))),
-    l: lineupFacts(game, team),
-    b: benchFacts(game, team)
+    l: lineupFacts(game, team, playersById),
+    b: benchFacts(game, team, playersById)
   };
 }
 
 function roundFacts(game, round) {
+  const playersById = new Map(game.players.map(player => [player.id, player]));
+  const teamsById = new Map(game.teams.map(team => [team.id, team]));
   return {
     r: round.number,
     f: round.games.map(fixture => ({
-      h: teamFacts(game, game.teams.find(team => team.id === fixture.home)),
-      a: teamFacts(game, game.teams.find(team => team.id === fixture.away))
+      h: teamFacts(game, teamsById.get(fixture.home), playersById),
+      a: teamFacts(game, teamsById.get(fixture.away), playersById)
     }))
   };
 }
@@ -144,31 +150,23 @@ function createDeepSeekMatchService(options = {}) {
   const model = options.model || DEEPSEEK_MODEL;
   const endpoint = options.endpoint || DEEPSEEK_API_URL;
   const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const batchSize = Math.max(1, Math.min(5, Number(options.batchSize ?? process.env.DEEPSEEK_BATCH_SIZE) || DEFAULT_BATCH_SIZE));
-  const timeoutMs = Number(options.timeoutMs) || 90_000;
+  const batchSize = Math.floor(Math.max(1, Math.min(5, Number(options.batchSize ?? process.env.DEEPSEEK_BATCH_SIZE) || DEFAULT_BATCH_SIZE)));
+  const requestedTimeout = Number(options.timeoutMs);
+  const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? Math.min(2_147_483_647, Math.ceil(requestedTimeout)) : 90_000;
   const maxRetries = Math.max(0, Math.min(4, Number.isInteger(options.maxRetries) ? options.maxRetries : 2));
   const retryDelayMs = Math.max(0, options.retryDelayMs === undefined ? 300 : Number(options.retryDelayMs) || 0);
-  const maxTokens = Math.max(2_000, Math.min(12_000, Number(options.maxTokens ?? process.env.DEEPSEEK_MAX_TOKENS) || DEFAULT_MAX_TOKENS));
-  const available = Boolean(enabled && apiKey && fetchImpl);
+  const maxTokens = Math.floor(Math.max(2_000, Math.min(12_000, Number(options.maxTokens ?? process.env.DEEPSEEK_MAX_TOKENS) || DEFAULT_MAX_TOKENS)));
+  const available = Boolean(enabled && apiKey && typeof fetchImpl === 'function');
+  const inFlight = new WeakMap();
 
-  async function requestBatchOnce(game, round, fixtures, batchNumber) {
+  async function readBatchResponse(game, round, fixtures, batchNumber, body, signal) {
     let response;
     try {
       response = await fetchImpl(endpoint, {
         method: 'POST',
         headers: {'content-type': 'application/json', authorization: `Bearer ${apiKey}`},
-        body: JSON.stringify({
-          model,
-          messages: [
-            {role: 'system', content: systemPrompt()},
-            {role: 'user', content: JSON.stringify({...roundFacts(game, {number: round.number, games: fixtures}), b: batchNumber})}
-          ],
-          thinking: {type: 'disabled'},
-          response_format: {type: 'json_object'},
-          max_tokens: maxTokens,
-          stream: false
-        }),
-        signal: AbortSignal.timeout(timeoutMs)
+        body,
+        signal
       });
     } catch (error) {
       const timeout = /timeout|aborted/i.test(`${error.name} ${error.message}`);
@@ -176,7 +174,9 @@ function createDeepSeekMatchService(options = {}) {
     }
     if (!response.ok) {
       const details = String(await response.text()).trim().slice(0, 300);
-      throw new Error(`第 ${batchNumber} 批 DeepSeek 请求失败（${response.status}）${details ? `：${details}` : ''}`);
+      const error = new Error(`第 ${batchNumber} 批 DeepSeek 请求失败（${response.status}）${details ? `：${details}` : ''}`);
+      error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      throw error;
     }
     let parsed;
     try {
@@ -184,41 +184,83 @@ function createDeepSeekMatchService(options = {}) {
     } catch (error) {
       throw new Error(`第 ${batchNumber} 批 JSON 无法解析：${error.message}`);
     }
-    if (!Array.isArray(parsed.matches)) throw new Error(`第 ${batchNumber} 批返回内容缺少 matches 数组`);
+    if (!Array.isArray(parsed?.matches)) throw new Error(`第 ${batchNumber} 批返回内容缺少 matches 数组`);
     if (parsed.matches.length !== fixtures.length) throw new Error(`第 ${batchNumber} 批应返回 ${fixtures.length} 场，实际返回 ${parsed.matches.length} 场`);
     return parsed.matches.map((match, index) => decodeCompactMatch(match, game, fixtures[index]));
   }
 
-  async function requestBatch(game, round, fixtures, batchNumber) {
-    let lastError;
+  async function requestBatchOnce(game, round, fixtures, batchNumber, body) {
+    const controller = new AbortController();
+    let timer;
+    const deadline = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`第 ${batchNumber} 批 DeepSeek 请求超过 ${Math.round(timeoutMs / 1000)} 秒`);
+        controller.abort(error);
+        reject(error);
+      }, timeoutMs);
+    });
+    try {
+      // Include response-body consumption in the deadline, even for a custom fetch implementation.
+      return await Promise.race([readBatchResponse(game, round, fixtures, batchNumber, body, controller.signal), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function requestBatch(game, round, fixtures, batchNumber, factsByFixture) {
+    const body = JSON.stringify({
+      model,
+      messages: [
+        {role: 'system', content: systemPrompt()},
+        {role: 'user', content: JSON.stringify({r: round.number, f: fixtures.map(fixture => factsByFixture.get(`${fixture.home}:${fixture.away}`)), b: batchNumber})}
+      ],
+      thinking: {type: 'disabled'},
+      response_format: {type: 'json_object'},
+      max_tokens: maxTokens,
+      stream: false
+    });
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        return await requestBatchOnce(game, round, fixtures, batchNumber);
+        return await requestBatchOnce(game, round, fixtures, batchNumber, body);
       } catch (error) {
-        lastError = error;
+        if (error.retryable === false || attempt === maxRetries) {
+          throw new Error(`${error.message}（已尝试 ${attempt + 1} 次）`);
+        }
         if (attempt < maxRetries && retryDelayMs) {
           await new Promise(resolve => setTimeout(resolve, retryDelayMs * 2 ** attempt));
         }
       }
     }
-    throw new Error(`${lastError.message}（已尝试 ${maxRetries + 1} 次）`);
   }
 
-  async function simulateRound(game, round) {
+  async function generateRound(game, round) {
     if (!available) throw new Error('尚未配置 DEEPSEEK_API_KEY，无法使用 AI 比赛引擎');
-    game.aiSimulationCache = game.aiSimulationCache && typeof game.aiSimulationCache === 'object' ? game.aiSimulationCache : {};
+    const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    game.aiSimulationCache = isRecord(game.aiSimulationCache) ? game.aiSimulationCache : {};
     const roundKey = String(round.number);
-    const cache = game.aiSimulationCache[roundKey] && typeof game.aiSimulationCache[roundKey] === 'object'
+    const cache = isRecord(game.aiSimulationCache[roundKey])
       ? game.aiSimulationCache[roundKey]
       : (game.aiSimulationCache[roundKey] = {});
     const keyFor = fixture => `${fixture.home}:${fixture.away}`;
+    const signatureRounds = isRecord(game.aiSimulationCache.signatures)
+      ? game.aiSimulationCache.signatures
+      : (game.aiSimulationCache.signatures = {});
+    const signatures = isRecord(signatureRounds[roundKey]) ? signatureRounds[roundKey] : (signatureRounds[roundKey] = {});
+    const facts = roundFacts(game, round);
+    const factsByFixture = new Map(round.games.map((fixture, index) => [keyFor(fixture), facts.f[index]]));
+    for (const fixture of round.games) {
+      const key = keyFor(fixture);
+      const signature = createHash('sha256').update(JSON.stringify({model, round: round.number, facts: factsByFixture.get(key)})).digest('hex');
+      if (signatures[key] !== signature) delete cache[key];
+      signatures[key] = signature;
+    }
     const remaining = round.games.filter(fixture => !cache[keyFor(fixture)]);
     const batches = [];
     for (let index = 0; index < remaining.length; index += batchSize) batches.push(remaining.slice(index, index + batchSize));
     const settled = await Promise.allSettled(batches.map(async (fixtures, index) => {
-      const matches = await requestBatch(game, round, fixtures, index + 1);
+      const matches = await requestBatch(game, round, fixtures, index + 1, factsByFixture);
       matches.forEach((match, matchIndex) => { cache[keyFor(fixtures[matchIndex])] = match; });
-      if (game.simulation) game.simulation.completedMatches = Object.keys(cache).length;
+      if (game.simulation) game.simulation.completedMatches = round.games.filter(fixture => cache[keyFor(fixture)]).length;
       return matches;
     }));
     const failed = settled.find(result => result.status === 'rejected');
@@ -226,6 +268,22 @@ function createDeepSeekMatchService(options = {}) {
     const missing = round.games.find(fixture => !cache[keyFor(fixture)]);
     if (missing) throw new Error(`AI 缓存缺少对阵 ${missing.home}:${missing.away}`);
     return round.games.map(fixture => cache[keyFor(fixture)]);
+  }
+
+  function simulateRound(game, round) {
+    let rounds = inFlight.get(game);
+    if (!rounds) {
+      rounds = new Map();
+      inFlight.set(game, rounds);
+    }
+    const roundKey = String(round.number);
+    if (rounds.has(roundKey)) return rounds.get(roundKey);
+    const pending = generateRound(game, round).finally(() => {
+      rounds.delete(roundKey);
+      if (!rounds.size) inFlight.delete(game);
+    });
+    rounds.set(roundKey, pending);
+    return pending;
   }
 
   return {available, model, batchSize, maxRetries, maxTokens, simulateRound};

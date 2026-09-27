@@ -1,71 +1,378 @@
-let G=null, ACCOUNT=null, tab='lobby', draftFilter='ALL', draftSearch='', clubTeamId=null, busy=false, formationEditor=null, pendingJoinCode=null, pendingJoinRevision=null,progressTimer=null;
-const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const leagueTeams=['北京龙','上海星港','广州雄狮','深圳鹏城','成都凤凰','重庆山城','武汉江豚','杭州钱潮','南京金陵','苏州园林','天津海河','青岛海风','大连浪潮','济南泰山','西安长安','郑州中原','长沙湘军','厦门鹭岛','昆明云岭','沈阳铁骑'].map((name,index)=>({id:`t${index+1}`,name}));
-$('hostTeam').innerHTML=leagueTeams.map(team=>`<option value="${team.id}">${team.name}</option>`).join('');
-async function api(path,method='GET',data){const roomId=path.match(/^\/games\/([^/]+)/)?.[1],headers={'content-type':'application/json'};if(method!=='GET'&&roomId){const revision=G?.id===roomId?G.revision:pendingJoinCode===roomId?pendingJoinRevision:null;if(revision!==null&&revision!==undefined)headers['x-game-version']=String(revision)}const r=await fetch('/api'+path,{method,headers,body:data?JSON.stringify(data):undefined}),x=await r.json();if(!r.ok){const error=Error(x.error);error.status=r.status;throw error}return x}
-function toast(s){$('toast').textContent=s;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),2200)}
-async function enterLoginLayer(){$('gate').classList.add('hidden');try{await enterAccount(await api('/auth/session'))}catch{$('login').classList.remove('hidden')}}
-async function unlockSite(){const accessKey=$('siteAccessKey').value;if(accessKey.length<8)return toast('朋友访问密钥至少需要 8 位');try{await api('/gate/unlock','POST',{accessKey});$('siteAccessKey').value='';await enterLoginLayer()}catch(e){toast(e.message);$('siteAccessKey').focus()}}
-async function enterAccount(result){ACCOUNT=result.user;$('gate').classList.add('hidden');$('login').classList.add('hidden');$('welcome').classList.remove('hidden');$('accountBadge').classList.remove('hidden');$('accountBadge').innerHTML=`<span>${esc(ACCOUNT.username)}</span><button class="secondary compact" onclick="logoutAccount()">退出</button>`;if($('managerName').value==='主教练')$('managerName').value=ACCOUNT.username;const linked=new URLSearchParams(location.search).get('game'),gameId=(linked||localStorage.gameId||'').trim().toUpperCase();if(linked)$('roomCode').value=gameId;if(gameId)try{const room=await api('/games/'+gameId);if(room.session||room.access?.legacyClaimRequired){G=room;localStorage.gameId=room.id;showApp()}else if(!linked)localStorage.removeItem('gameId')}catch{if(!linked)localStorage.removeItem('gameId')}}
-async function loginAccount(){try{await enterAccount(await api('/auth/login','POST',{username:$('loginUsername').value,password:$('loginPassword').value}))}catch(e){toast(e.message)}}
-async function registerAccount(){try{await enterAccount(await api('/auth/register','POST',{username:$('loginUsername').value,password:$('loginPassword').value}));toast('账号创建成功')}catch(e){toast(e.message)}}
-async function logoutAccount(){try{await api('/auth/logout','POST')}finally{location.reload()}}
-async function createGame(){try{G=await api('/games','POST',{name:$('leagueName').value,host:$('managerName').value,teamId:$('hostTeam').value});localStorage.gameId=G.id;showApp()}catch(e){toast(e.message)}}
-async function joinGame(){const code=$('roomCode').value.trim().toUpperCase();if(!code)return toast('请输入房间码');pendingJoinCode=code;try{const room=await api('/games/'+code);if(room.session||room.access?.legacyClaimRequired){G=room;localStorage.gameId=G.id;return showApp()}const available=room.teams.filter(team=>team.controller==='AI');if(room.phase!=='lobby')throw Error('联赛已经开始，无法加入');if(!available.length)throw Error('当前房间没有可选球队');pendingJoinRevision=room.revision;const humans=room.teams.filter(team=>team.controller==='human').length,m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card join-team-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>加入房间 ${room.id}</small><h2>选择你的球队</h2><p class="muted">确认后，这支球队会直接绑定到账号 ${esc(ACCOUNT.username)}，无需保存额外密钥。</p><div class="join-team-summary"><span><small>联赛</small><b>${esc(room.name)}</b></span><span><small>已加入真人</small><b>${humans} 人</b></span><span><small>可选球队</small><b>${available.length} 支</b></span></div><label>球队<select id="joinTeam">${available.map(team=>`<option value="${team.id}">${esc(team.name)}</option>`).join('')}</select></label><div class="join-team-actions"><button class="secondary" onclick="closeModal()">取消</button><button onclick="confirmJoinGame()">确认加入</button></div></div></div>`;m.classList.remove('hidden')}catch(e){toast(e.message)}}
-async function confirmJoinGame(){const teamId=$('joinTeam')?.value;if(!pendingJoinCode||!teamId)return toast('请选择球队');try{G=await api('/games/'+pendingJoinCode+'/join','POST',{manager:$('managerName').value,teamId});localStorage.gameId=G.id;pendingJoinCode=null;pendingJoinRevision=null;closeModal();showApp()}catch(e){toast(e.message)}}
-async function pollProgress(){try{const state=await api('/games/'+G.id);if(state.simulation){G=state;render()}}catch{}}
-async function act(path,data){if(busy)return;busy=true;if(path.startsWith('/play-'))progressTimer=setInterval(pollProgress,1200);render();try{G=await api('/games/'+G.id+path,'POST',data||{});busy=false;clearInterval(progressTimer);progressTimer=null;render()}catch(e){busy=false;clearInterval(progressTimer);progressTimer=null;if(e.status===409||e.status===428)try{G=await api('/games/'+G.id)}catch{}render();toast(e.message)}}
-function openDeleteGame(){const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card delete-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>危险操作</small><h2>删除房间 ${G.id}</h2><p class="muted">房间、阵容和比赛结果将从当前存档中移除。请输入完整房间码确认。</p><label>房间码<input id="deleteConfirmCode" autocomplete="off" placeholder="${G.id}"></label><div class="delete-actions"><button class="secondary" onclick="closeModal()">取消</button><button class="danger solid" onclick="confirmDeleteGame()">确认删除</button></div></div></div>`;m.classList.remove('hidden');$('deleteConfirmCode').focus()}
-async function confirmDeleteGame(){const code=$('deleteConfirmCode').value.trim().toUpperCase();if(code!==G.id)return toast('房间码不匹配，无法删除');try{await api('/games/'+G.id,'DELETE',{confirmCode:code});localStorage.removeItem('gameId');location.href='/'}catch(e){toast(e.message)}}
+let G = null;
+let ACCOUNT = null;
+let tab = 'lobby';
+let draftFilter = 'ALL';
+let draftSearch = '';
+let clubTeamId = null;
+let busy = false;
+let formationEditor = null;
+let pendingJoinCode = null;
+let pendingJoinRevision = null;
+let entryBusy = false;
+let progressTimer = null;
+let progressController = null;
+let progressGeneration = 0;
+let toastTimer = null;
+let formationDragCleanup = null;
+
+const $ = id => document.getElementById(id);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+})[character]);
+const leagueTeams = ['北京龙', '上海星港', '广州雄狮', '深圳鹏城', '成都凤凰', '重庆山城', '武汉江豚', '杭州钱潮', '南京金陵', '苏州园林', '天津海河', '青岛海风', '大连浪潮', '济南泰山', '西安长安', '郑州中原', '长沙湘军', '厦门鹭岛', '昆明云岭', '沈阳铁骑'].map((name, index) => ({id: `t${index + 1}`, name}));
+$('hostTeam').innerHTML = leagueTeams.map(team => `<option value="${team.id}">${team.name}</option>`).join('');
+
+async function api(path, method = 'GET', data, options = {}) {
+  const roomId = path.match(/^\/games\/([^/]+)/)?.[1];
+  const headers = {accept: 'application/json'};
+  if (data !== undefined) headers['content-type'] = 'application/json';
+  if (method !== 'GET' && roomId) {
+    const revision = G?.id === roomId ? G.revision : pendingJoinCode === roomId ? pendingJoinRevision : null;
+    if (revision !== null && revision !== undefined) headers['x-game-version'] = String(revision);
+  }
+  const response = await fetch('/api' + path, {
+    method, headers, signal: options.signal,
+    body: data === undefined ? undefined : JSON.stringify(data)
+  });
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    const error = Error(response.ok ? '服务器返回了无法读取的数据，请重试' : `请求失败（${response.status}），请稍后重试`);
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = Error(typeof payload?.error === 'string' ? payload.error : `请求失败（${response.status}），请稍后重试`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+function toast(message) {
+  clearTimeout(toastTimer);
+  $('toast').textContent = message;
+  $('toast').classList.add('show');
+  toastTimer = setTimeout(() => $('toast').classList.remove('show'), 2200);
+}
+
+// Room persistence is optional: private browsing or blocked storage must not prevent play.
+function savedGameId() {
+  try { return localStorage.getItem('gameId') || ''; } catch { return ''; }
+}
+function rememberGame(id) {
+  try {
+    if (id) localStorage.setItem('gameId', id);
+    else localStorage.removeItem('gameId');
+  } catch {}
+}
+
+// A single entry lock also prevents competing create/join requests from changing rooms.
+async function entryAction(action) {
+  if (entryBusy) return;
+  entryBusy = true;
+  const buttons = [...document.querySelectorAll('#gate button, #login button, #welcome button, .join-team-actions button')];
+  const disabled = buttons.map(button => button.disabled);
+  buttons.forEach(button => { button.disabled = true; });
+  try { return await action(); }
+  catch (error) { toast(error.message || '请求失败，请重试'); }
+  finally {
+    entryBusy = false;
+    buttons.forEach((button, index) => { button.disabled = disabled[index]; });
+  }
+}
+
+async function enterLoginLayer() {
+  $('gate').classList.add('hidden');
+  try { await enterAccount(await api('/auth/session')); }
+  catch { $('login').classList.remove('hidden'); }
+}
+
+async function unlockSite() {
+  const accessKey = $('siteAccessKey').value;
+  if (accessKey.length < 8) return toast('朋友访问密钥至少需要 8 位');
+  return entryAction(async () => {
+    try {
+      await api('/gate/unlock', 'POST', {accessKey});
+      $('siteAccessKey').value = '';
+      await enterLoginLayer();
+    } catch (error) {
+      $('siteAccessKey').focus();
+      throw error;
+    }
+  });
+}
+
+async function enterAccount(result) {
+  ACCOUNT = result.user;
+  $('gate').classList.add('hidden');
+  $('login').classList.add('hidden');
+  $('welcome').classList.remove('hidden');
+  $('accountBadge').classList.remove('hidden');
+  $('accountBadge').innerHTML = `<span>${esc(ACCOUNT.username)}</span><button class="secondary compact" onclick="logoutAccount()">退出</button>`;
+  if ($('managerName').value === '主教练') $('managerName').value = ACCOUNT.username;
+  const linked = new URLSearchParams(location.search).get('game');
+  const gameId = (linked || savedGameId()).trim().toUpperCase();
+  if (linked) $('roomCode').value = gameId;
+  if (!gameId) return;
+  try {
+    const room = await api('/games/' + encodeURIComponent(gameId));
+    if (room.session || room.access?.legacyClaimRequired) {
+      G = room;
+      rememberGame(room.id);
+      showApp();
+    } else if (!linked) rememberGame(null);
+  } catch (error) {
+    // Transient failures should not erase the user's last room.
+    if (!linked && [403, 404].includes(error.status)) rememberGame(null);
+  }
+}
+
+function loginAccount() {
+  return entryAction(async () => {
+    await enterAccount(await api('/auth/login', 'POST', {username: $('loginUsername').value, password: $('loginPassword').value}));
+    $('loginPassword').value = '';
+  });
+}
+function registerAccount() {
+  return entryAction(async () => {
+    await enterAccount(await api('/auth/register', 'POST', {username: $('loginUsername').value, password: $('loginPassword').value}));
+    $('loginPassword').value = '';
+    toast('账号创建成功');
+  });
+}
+async function logoutAccount() {
+  try { await api('/auth/logout', 'POST'); }
+  catch (error) { return toast(error.message); }
+  location.reload();
+}
+function createGame() {
+  return entryAction(async () => {
+    G = await api('/games', 'POST', {name: $('leagueName').value, host: $('managerName').value, teamId: $('hostTeam').value});
+    rememberGame(G.id);
+    showApp();
+  });
+}
+function joinGame() {
+  const code = $('roomCode').value.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) return toast('请输入 6 位字母或数字房间码');
+  return entryAction(async () => {
+    const room = await api('/games/' + code);
+    if (room.session || room.access?.legacyClaimRequired) {
+      G = room;
+      rememberGame(G.id);
+      return showApp();
+    }
+    const available = room.teams.filter(team => team.controller === 'AI');
+    if (room.phase !== 'lobby') throw Error('联赛已经开始，无法加入');
+    if (!available.length) throw Error('当前房间没有可选球队');
+    pendingJoinCode = code;
+    pendingJoinRevision = room.revision;
+    const humans = room.teams.filter(team => team.controller === 'human').length;
+    const modal = $('modal');
+    modal.innerHTML = `<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card join-team-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>加入房间 ${esc(room.id)}</small><h2>选择你的球队</h2><p class="muted">确认后，这支球队会直接绑定到账号 ${esc(ACCOUNT.username)}，无需保存额外密钥。</p><div class="join-team-summary"><span><small>联赛</small><b>${esc(room.name)}</b></span><span><small>已加入真人</small><b>${humans} 人</b></span><span><small>可选球队</small><b>${available.length} 支</b></span></div><label>球队<select id="joinTeam">${available.map(team => `<option value="${esc(team.id)}">${esc(team.name)}</option>`).join('')}</select></label><div class="join-team-actions"><button class="secondary" onclick="closeModal()">取消</button><button onclick="confirmJoinGame()">确认加入</button></div></div></div>`;
+    modal.classList.remove('hidden');
+  });
+}
+function confirmJoinGame() {
+  const teamId = $('joinTeam')?.value;
+  const code = pendingJoinCode;
+  if (!code || !teamId) return toast('请选择球队');
+  return entryAction(async () => {
+    try {
+      G = await api('/games/' + code + '/join', 'POST', {manager: $('managerName').value, teamId});
+      rememberGame(G.id);
+      closeModal();
+      showApp();
+    } catch (error) {
+      if ([409, 428].includes(error.status)) {
+        // Keep the modal usable after another manager takes a team.
+        try {
+          const room = await api('/games/' + code);
+          pendingJoinRevision = room.revision;
+          const select = $('joinTeam');
+          if (select) select.innerHTML = room.teams.filter(team => team.controller === 'AI').map(team => `<option value="${esc(team.id)}">${esc(team.name)}</option>`).join('');
+        } catch {}
+      }
+      throw error;
+    }
+  });
+}
+
+function stopProgressPolling() {
+  progressGeneration++;
+  clearTimeout(progressTimer);
+  progressTimer = null;
+  progressController?.abort();
+  progressController = null;
+}
+function startProgressPolling(roomId) {
+  stopProgressPolling();
+  const generation = progressGeneration;
+  progressTimer = setTimeout(() => pollProgress(roomId, generation), 1200);
+}
+async function pollProgress(roomId, generation) {
+  if (!busy || generation !== progressGeneration || G?.id !== roomId) return;
+  const controller = new AbortController();
+  progressController = controller;
+  try {
+    const state = await api('/games/' + roomId, 'GET', undefined, {signal: controller.signal});
+    if (!busy || generation !== progressGeneration || G?.id !== roomId) return;
+    if (state.simulation && Number(state.revision) >= Number(G.revision)) {
+      G = state;
+      // Avoid destroying unsaved lineup controls when the user switches tabs.
+      if (tab === 'fixtures') render();
+    }
+  } catch {
+    // Progress is best effort; the action request reports the final result/error.
+  } finally {
+    if (progressController === controller) progressController = null;
+    if (busy && generation === progressGeneration && G?.id === roomId) {
+      // Schedule after completion so slow requests can never overlap.
+      progressTimer = setTimeout(() => pollProgress(roomId, generation), 1200);
+    }
+  }
+}
+async function act(path, data) {
+  if (busy || !G) return;
+  const roomId = G.id;
+  busy = true;
+  if (path.startsWith('/play-')) startProgressPolling(roomId);
+  render();
+  let failure;
+  try {
+    const state = await api('/games/' + roomId + path, 'POST', data ?? {});
+    stopProgressPolling();
+    if (G?.id === roomId) G = state;
+  } catch (error) {
+    failure = error;
+    stopProgressPolling();
+    if (path.startsWith('/play-') || [409, 428].includes(error.status)) {
+      // A season can finish several rounds before failing; always read its settled state.
+      try {
+        const state = await api('/games/' + roomId);
+        if (G?.id === roomId) G = state;
+      } catch {}
+    }
+  } finally {
+    busy = false;
+    stopProgressPolling();
+    render();
+  }
+  if (failure) toast(failure.message);
+}
+function openDeleteGame(){const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card delete-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>危险操作</small><h2>删除房间 ${esc(G.id)}</h2><p class="muted">房间、阵容和比赛结果将从当前存档中移除。请输入完整房间码确认。</p><label>房间码<input id="deleteConfirmCode" autocomplete="off" placeholder="${esc(G.id)}"></label><div class="delete-actions"><button class="secondary" onclick="closeModal()">取消</button><button class="danger solid" onclick="confirmDeleteGame()">确认删除</button></div></div></div>`;m.classList.remove('hidden');$('deleteConfirmCode').focus()}
+async function confirmDeleteGame(){const code=$('deleteConfirmCode').value.trim().toUpperCase();if(code!==G.id)return toast('房间码不匹配，无法删除');try{await api('/games/'+G.id,'DELETE',{confirmCode:code});rememberGame(null);location.href='/'}catch(e){toast(e.message)}}
 async function claimLegacyRoom(){const code=prompt('请输入完整房间码，将旧房间的房主权限绑定到当前账号');if(!code)return;try{G=await api('/games/'+G.id+'/claim-host','POST',{confirmCode:code});render();toast('房主权限已绑定到当前账号')}catch(e){toast(e.message)}}
 function showApp(){$('gate').classList.add('hidden');$('login').classList.add('hidden');$('welcome').classList.add('hidden');$('app').classList.remove('hidden');render()}
-const team=id=>G.teams.find(t=>t.id===id), player=id=>G.players.find(p=>p.id===id);
+let indexedGame = null;
+let gameIndex = null;
+function indices() {
+  if (!gameIndex || indexedGame !== G) {
+    indexedGame = G;
+    gameIndex = {
+      teams: new Map((G?.teams || []).map(item => [item.id, item])),
+      players: new Map((G?.players || []).map(item => [item.id, item])),
+      season: new Map((G?.seasonPlayerStats || []).map(item => [item.playerId, item])),
+      results: new Map((G?.results || []).map(item => [`${item.round}:${item.home}`, item]))
+    };
+  }
+  return gameIndex;
+}
+const team = id => indices().teams.get(id);
+const player = id => indices().players.get(id);
+const matchResult = (round, homeId) => indices().results.get(`${round}:${homeId}`);
 function render(){
-  $('roomBadge').innerHTML=`房间码 <b>${G.id}</b>`;
+  if (!G) return;
+  $('roomBadge').innerHTML=`房间码 <b>${esc(G.id)}</b>`;
   const tabs=[['lobby','联赛大厅'],['draft','选秀中心'],['squad','战术与阵容'],['clubs','球队情报'],['fixtures','赛程赛果'],['table','积分榜'],['stats','赛季数据']];
   $('tabs').innerHTML=tabs.map(x=>`<button class="${tab===x[0]?'active':''}" onclick="tab='${x[0]}';render()">${x[1]}</button>`).join('');
-  $('view').innerHTML=views[tab]();
+  $('view').innerHTML=(views[tab] || views.lobby)();
+  if (busy) document.querySelectorAll('#view button:not(.report-button)').forEach(button => { button.disabled = true; });
 }
 const header=(title,sub,actions='')=>`<div class="topline"><div><h1>${title}</h1><p>${sub}</p></div><div class="actions">${actions}</div></div>`;
 const empty=s=>`<div class="card empty">${s}</div>`;
 const posText=p=>p.positions.map(x=>G.config.positionLabels[x]||x).join(' / ');
-const seasonRow=id=>(G.seasonPlayerStats||[]).find(row=>row.playerId===id);
+const seasonRow = id => indices().season.get(id);
 function availability(id){const source=seasonRow(id)?.status||G.playerStatuses?.[id]||{};if(Number(source.injuryMatches)>0)return{type:'injured',label:`伤病 · ${source.injuryMatches} 轮`,detail:source.injury||'伤病恢复中'};if(Number(source.suspensionMatches)>0)return{type:'suspended',label:`停赛 · ${source.suspensionMatches} 场`,detail:'纪律停赛'};return{type:'available',label:'可出场',detail:`累计黄牌 ${Number(source.yellowCards)||0}/5`}}
 const statusBadge=id=>{const status=availability(id);return `<span class="availability ${status.type}" title="${esc(status.detail)}">${esc(status.label)}</span>`};
-function slotPositionKey(slot){const id=String(slot?.id||'');if(slot?.group==='GK'||id==='GK')return'GK';if(slot?.group==='CB')return'CB';if(slot?.group==='FB')return(Number(slot.x)||(id.startsWith('L')?25:75))<50?'LB':'RB';if(slot?.group==='DM')return'DM';if(slot?.group==='CM')return'CM';if(slot?.group==='AM')return'AM';if(slot?.group==='W')return(Number(slot.x)||(id.startsWith('L')?25:75))<50?'LW':'RW';return'ST'}
+function slotPositionKey(slot){const id=String(slot?.id||'');if(slot?.group==='GK'||id==='GK')return'GK';if(slot?.group==='CB')return'CB';if(slot?.group==='FB')return(Number.isFinite(Number(slot.x))?Number(slot.x):(id.startsWith('L')?25:75))<50?'LB':'RB';if(slot?.group==='DM')return'DM';if(slot?.group==='CM')return'CM';if(slot?.group==='AM')return'AM';if(slot?.group==='W')return(Number.isFinite(Number(slot.x))?Number(slot.x):(id.startsWith('L')?25:75))<50?'LW':'RW';return'ST'}
 const slotFamiliarity=(p,slot)=>Number(p?.positionFamiliarity?.[slotPositionKey(slot)]||0);
 const familiarityText=value=>value>=90?'天生位置':value>=75?'熟练':value>=55?'可客串':value>=35?'勉强':'陌生';
 const categoryNames={technical:'技术',mental:'精神',physical:'身体',goalkeeping:'门将'};
 function averageChips(p){return Object.entries(p.categoryAverages).map(([k,v])=>`<span class="attribute-chip"><i>${categoryNames[k]}</i><b>${v}</b></span>`).join('')}
-function attributeGrid(p){return Object.entries(G.config.attributeLabels).map(([group,labels])=>`<div class="attribute-group"><h4>${categoryNames[group]}</h4>${Object.entries(labels).map(([key,label])=>`<div><span>${label}</span><b class="attr-${p.attributes[key]>=16?'elite':p.attributes[key]>=13?'good':'normal'}">${p.attributes[key]}</b></div>`).join('')}</div>`).join('')}
-function openPlayer(id){const p=player(id),m=$('modal'),stats=seasonRow(id),familiarities=Object.entries(G.config.positionLabels).map(([key,label])=>{const value=Number(p.positionFamiliarity?.[key]||0);return `<span class="familiarity-${value>=90?'natural':value>=75?'good':value>=55?'cover':value>=35?'poor':'bad'}"><i>${label}</i><b>${value}</b><small>${familiarityText(value)}</small></span>`}).join(''),season=stats?`<h3 class="profile-section-title">本赛季</h3><div class="player-physical season-summary"><span><small>出场 / 首发</small><b>${stats.appearances} / ${stats.starts}</b></span><span><small>进球 / 助攻</small><b>${stats.goals} / ${stats.assists}</b></span><span><small>场均评分</small><b>${stats.averageRating||'—'}</b></span><span><small>射门</small><b>${stats.shots}</b></span><span><small>传球成功</small><b>${stats.passesCompleted}/${stats.passes}</b></span><span><small>红 / 黄牌</small><b>${stats.redCards} / ${stats.yellowCards}</b></span></div>`:'';m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card player-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>${esc(p.era)} · ${posText(p)}</small><h2>${esc(p.name)} <em>${p.rating}</em> ${statusBadge(id)}</h2><div class="player-physical"><span><small>身高</small><b>${p.heightCm} cm</b></span><span><small>体重</small><b>${p.weightKg} kg</b></span><span><small>主要位置</small><b>${esc(G.config.positionLabels[p.position]||p.position)}</b></span></div>${season}<h3 class="profile-section-title">位置熟练度</h3><div class="position-familiarities">${familiarities}</div><div class="attribute-summary">${averageChips(p)}</div><div class="attribute-grid">${attributeGrid(p)}</div><p class="muted modal-note">身高、体重、位置熟练度和职责关键属性都会影响比赛表现；属性范围为 1–20。</p></div></div>`;m.classList.remove('hidden')}
-function closeModal(){$('modal').classList.add('hidden');$('modal').innerHTML=''}
-function reportRatingRows(result,side){const club=team(result[side]),entries=result.lineups?.[side]||[],ratings=new Map(result.report.playerRatings.filter(x=>x.teamId===club.id).map(x=>[x.playerId,x]));return entries.map(entry=>{const p=player(entry.playerId),rating=ratings.get(entry.playerId);if(!p||!rating)return'';const goals=result.report.events.filter(e=>e.type==='goal'&&e.playerId===p.id).length,note=[goals?`${goals}球`:'',result.report.playerOfMatch===p.id?'全场最佳':'',rating.note||''].filter(Boolean).join(' · ');return `<button class="report-rating-row" onclick="openPlayer('${p.id}')"><span class="report-slot">${esc(entry.slotId)}</span><span><b>${esc(p.name)}</b><small>${esc(posText(p))}${note?' · '+esc(note):''}</small></span><strong class="match-rating rating-${rating.rating>=8?'elite':rating.rating>=7?'good':rating.rating<6?'low':'normal'}">${rating.rating.toFixed(1)}</strong></button>`}).join('')}
+function attributeGrid(p){return Object.entries(G.config.attributeLabels).map(([group,labels])=>`<div class="attribute-group"><h4>${categoryNames[group]}</h4>${Object.entries(labels).map(([key,label])=>`<div><span>${esc(label)}</span><b class="attr-${p.attributes[key]>=16?'elite':p.attributes[key]>=13?'good':'normal'}">${esc(p.attributes[key])}</b></div>`).join('')}</div>`).join('')}
+function openPlayer(id){const p=player(id);if(!p)return toast('球员资料暂不可用');const m=$('modal'),stats=seasonRow(id),familiarities=Object.entries(G.config.positionLabels).map(([key,label])=>{const value=Number(p.positionFamiliarity?.[key]||0);return `<span class="familiarity-${value>=90?'natural':value>=75?'good':value>=55?'cover':value>=35?'poor':'bad'}"><i>${esc(label)}</i><b>${value}</b><small>${familiarityText(value)}</small></span>`}).join(''),season=stats?`<h3 class="profile-section-title">本赛季</h3><div class="player-physical season-summary"><span><small>出场 / 首发</small><b>${stats.appearances} / ${stats.starts}</b></span><span><small>进球 / 助攻</small><b>${stats.goals} / ${stats.assists}</b></span><span><small>场均评分</small><b>${stats.averageRating||'—'}</b></span><span><small>射门</small><b>${stats.shots}</b></span><span><small>传球成功</small><b>${stats.passesCompleted}/${stats.passes}</b></span><span><small>红 / 黄牌</small><b>${stats.redCards} / ${stats.yellowCards}</b></span></div>`:'';m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card player-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>${esc(p.era)} · ${esc(posText(p))}</small><h2>${esc(p.name)} <em>${p.rating}</em> ${statusBadge(id)}</h2><div class="player-physical"><span><small>身高</small><b>${p.heightCm} cm</b></span><span><small>体重</small><b>${p.weightKg} kg</b></span><span><small>主要位置</small><b>${esc(G.config.positionLabels[p.position]||p.position)}</b></span></div>${season}<h3 class="profile-section-title">位置熟练度</h3><div class="position-familiarities">${familiarities}</div><div class="attribute-summary">${averageChips(p)}</div><div class="attribute-grid">${attributeGrid(p)}</div><p class="muted modal-note">身高、体重、位置熟练度和职责关键属性都会影响比赛表现；属性范围为 1–20。</p></div></div>`;m.classList.remove('hidden')}
+function closeModal() {
+  formationDragCleanup?.();
+  formationEditor = null;
+  pendingJoinCode = null;
+  pendingJoinRevision = null;
+  $('modal').classList.add('hidden');
+  $('modal').innerHTML = '';
+}
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeModal();
+});
+function reportRatingRows(result, side) {
+  const club = team(result[side]);
+  if (!club) return '';
+  const entries = result.lineups?.[side] || [];
+  const ratings = new Map((result.report.playerRatings || []).filter(item => item.teamId === club.id).map(item => [item.playerId, item]));
+  const goalsByPlayer = new Map();
+  for (const event of result.report.events || []) {
+    if (event.type === 'goal') goalsByPlayer.set(event.playerId, (goalsByPlayer.get(event.playerId) || 0) + 1);
+  }
+  return entries.map(entry => {
+    const currentPlayer = player(entry.playerId);
+    const rating = ratings.get(entry.playerId);
+    if (!currentPlayer || !rating) return '';
+    const goals = goalsByPlayer.get(currentPlayer.id) || 0;
+    const score = Number(rating.rating) || 0;
+    const note = [goals ? `${goals}球` : '', result.report.playerOfMatch === currentPlayer.id ? '全场最佳' : '', rating.note || ''].filter(Boolean).join(' · ');
+    return `<button class="report-rating-row" onclick="openPlayer('${currentPlayer.id}')"><span class="report-slot">${esc(entry.slotId)}</span><span><b>${esc(currentPlayer.name)}</b><small>${esc(posText(currentPlayer))}${note ? ' · ' + esc(note) : ''}</small></span><strong class="match-rating rating-${score >= 8 ? 'elite' : score >= 7 ? 'good' : score < 6 ? 'low' : 'normal'}">${score.toFixed(1)}</strong></button>`;
+  }).join('');
+}
 const eventMeta={goal:['⚽','进球'],big_chance_missed:['◯','浪费机会'],key_pass:['➜','关键传球'],key_save:['🧤','关键扑救'],substitution:['↔','换人'],injury:['✚','伤病'],red_card:['▮','红牌'],tactical_change:['⌁','战术调整']};
-function reportEvent(event){const meta=eventMeta[event.type]||['•','关键事件'],club=team(event.teamId),actor=player(event.playerId)?.name||club?.name||'未知',related=event.relatedPlayerId?player(event.relatedPlayerId)?.name:'';const people=event.type==='substitution'&&related?`${actor} → ${related}`:`${actor}${related?' · 关联：'+related:''}`;return `<div class="report-event type-${event.type}"><time>${event.minute}'</time><span>${meta[0]} <b>${meta[1]}</b> · ${esc(people)}</span><small>${esc(event.description||club?.name||'')}</small></div>`}
+function reportEvent(event){const meta=eventMeta[event.type]||['•','关键事件'],club=team(event.teamId),actor=player(event.playerId)?.name||club?.name||'未知',related=event.relatedPlayerId?player(event.relatedPlayerId)?.name:'';const people=event.type==='substitution'&&related?`${actor} → ${related}`:`${actor}${related?' · 关联：'+related:''}`;return `<div class="report-event type-${eventMeta[event.type]?event.type:'other'}"><time>${event.minute}'</time><span>${meta[0]} <b>${meta[1]}</b> · ${esc(people)}</span><small>${esc(event.description||club?.name||'')}</small></div>`}
 const teamStatLabels=[['possession','控球率','%'],['shots','射门',''],['shotsOnTarget','射正',''],['bigChances','绝佳机会',''],['corners','角球',''],['fouls','犯规',''],['passAccuracy','传球成功率','%']];
-function reportTeamData(result){const stats=result.report.teamStats||{};return teamStatLabels.map(([key,label,suffix])=>{const home=Number(stats.home?.[key]||0),away=Number(stats.away?.[key]||0),total=Math.max(1,home+away),homeWidth=Math.round(home/total*100);return `<div class="team-stat-row"><strong>${home}${suffix}</strong><div><span>${label}</span><div class="stat-bar"><i style="width:${homeWidth}%"></i><b style="width:${100-homeWidth}%"></b></div></div><strong>${away}${suffix}</strong></div>`}).join('')}
-function reportPlayerData(result,side){const club=team(result[side]),ratings=new Map(result.report.playerRatings.map(item=>[item.playerId,item.rating])),rows=(result.report.playerStats||[]).filter(item=>item.teamId===club.id);return `<section class="player-stats-team"><h4>${esc(club.name)}</h4><div class="report-table-wrap"><table class="player-stats-table"><thead><tr><th>球员</th><th>身份</th><th>分钟</th><th>进球</th><th>助攻</th><th>射门</th><th>传球</th><th>成功传球</th><th>关键传球</th><th>失机</th><th>扑救</th><th>黄牌</th><th>红牌</th><th>评分</th></tr></thead><tbody>${rows.map(item=>{const p=player(item.playerId),rating=ratings.get(item.playerId);return `<tr class="${item.started?'':'substitute'}" onclick="openPlayer('${item.playerId}')"><td><b>${esc(p?.name||item.playerId)}</b></td><td>${item.started?'首发':'替补'}</td><td>${item.minutes}'</td><td>${item.goals}</td><td>${item.assists}</td><td>${item.shots??0}</td><td>${item.passes??0}</td><td>${item.passesCompleted??0}</td><td>${item.keyPasses}</td><td>${item.bigChancesMissed}</td><td>${item.saves}</td><td>${item.yellowCards??0}</td><td>${item.redCards??0}</td><td><b>${Number(rating||0).toFixed(1)}</b></td></tr>`}).join('')}</tbody></table></div></section>`}
+function reportTeamData(result){const stats=result.report.teamStats||{};return teamStatLabels.map(([key,label,suffix])=>{const home=Number(stats.home?.[key]||0),away=Number(stats.away?.[key]||0),total=Math.max(1,home+away),homeWidth=Math.round(home/total*100);return `<div class="team-stat-row"><strong>${home}${suffix}</strong><div><span>${esc(label)}</span><div class="stat-bar"><i style="width:${homeWidth}%"></i><b style="width:${100-homeWidth}%"></b></div></div><strong>${away}${suffix}</strong></div>`}).join('')}
+function reportPlayerData(result,side){const club=team(result[side]),ratings=new Map((result.report.playerRatings||[]).map(item=>[item.playerId,item.rating])),rows=(result.report.playerStats||[]).filter(item=>item.teamId===club.id);return `<section class="player-stats-team"><h4>${esc(club.name)}</h4><div class="report-table-wrap"><table class="player-stats-table"><thead><tr><th>球员</th><th>身份</th><th>分钟</th><th>进球</th><th>助攻</th><th>射门</th><th>传球</th><th>成功传球</th><th>关键传球</th><th>失机</th><th>扑救</th><th>黄牌</th><th>红牌</th><th>评分</th></tr></thead><tbody>${rows.map(item=>{const p=player(item.playerId),rating=ratings.get(item.playerId);return `<tr class="${item.started?'':'substitute'}" onclick="openPlayer('${item.playerId}')"><td><b>${esc(p?.name||item.playerId)}</b></td><td>${item.started?'首发':'替补'}</td><td>${item.minutes}'</td><td>${item.goals}</td><td>${item.assists}</td><td>${item.shots??0}</td><td>${item.passes??0}</td><td>${item.passesCompleted??0}</td><td>${item.keyPasses}</td><td>${item.bigChancesMissed}</td><td>${item.saves}</td><td>${item.yellowCards??0}</td><td>${item.redCards??0}</td><td><b>${Number(rating||0).toFixed(1)}</b></td></tr>`}).join('')}</tbody></table></div></section>`}
 function switchReportTab(name){document.querySelectorAll('.report-tab').forEach(button=>button.classList.toggle('active',button.dataset.tab===name));document.querySelectorAll('.report-panel').forEach(panel=>panel.classList.toggle('hidden',panel.dataset.panel!==name))}
-function openMatchReport(round,homeId){const result=G.results.find(x=>x.round===round&&x.home===homeId);if(!result?.report)return toast('这场比赛尚无战报');const report=result.report,home=team(result.home),away=team(result.away),events=report.events.map(reportEvent).join('')||'<p class="muted">本场没有记录到关键事件。</p>',isDeepSeek=report.source==='deepseek',source=isDeepSeek?'DeepSeek V4 Flash':'旧版比赛引擎',planCard=(club,plan)=>`<span><b>${esc(club.name)}</b><small>${plan?`${esc(plan.formation)} · ${esc(plan.mentality)} · ${esc(plan.reason)}`:'真人赛前设置'}</small></span>`,plans=`<div class="report-plans">${planCard(home,result.tacticalPlans?.home)}${planCard(away,result.tacticalPlans?.away)}</div>`;const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card report-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><div class="report-kicker"><span>第 ${round} 轮</span><span class="report-source ${isDeepSeek?'ai':''}">${source}</span></div><h2>${esc(report.headline)}</h2><div class="report-score"><span>${esc(home.name)}</span><b>${result.homeGoals} - ${result.awayGoals}</b><span>${esc(away.name)}</span></div>${plans}<div class="report-tabs"><button class="report-tab active" data-tab="story" onclick="switchReportTab('story')">比赛战报</button><button class="report-tab" data-tab="stats" onclick="switchReportTab('stats')">数据统计</button></div><div class="report-panel" data-panel="story"><p class="report-summary">${esc(report.summary)}</p><div class="report-tactical"><b>战术观察</b><span>${esc(report.tacticalNote||'暂无')}</span></div><div class="report-section"><h3>比赛关键事件</h3><div class="report-events">${events}</div></div><div class="report-section"><div class="report-ratings-title"><div><h3>球员评分</h3><small>双方首发球员评分；替补评分见数据统计</small></div></div><div class="report-ratings"><section><h4>${esc(home.name)}</h4>${reportRatingRows(result,'home')}</section><section><h4>${esc(away.name)}</h4>${reportRatingRows(result,'away')}</section></div></div></div><div class="report-panel hidden" data-panel="stats"><div class="report-section team-data"><div class="stats-team-head"><b>${esc(home.name)}</b><h3>球队数据</h3><b>${esc(away.name)}</b></div>${reportTeamData(result)}</div><div class="report-section"><h3>个人数据</h3>${reportPlayerData(result,'home')}${reportPlayerData(result,'away')}</div></div></div></div>`;m.classList.remove('hidden')}
+function openMatchReport(round,homeId){const result=matchResult(round,homeId);if(!result?.report)return toast('这场比赛尚无战报');const report=result.report,home=team(result.home),away=team(result.away),events=(report.events||[]).map(reportEvent).join('')||'<p class="muted">本场没有记录到关键事件。</p>',isDeepSeek=report.source==='deepseek',source=isDeepSeek?'DeepSeek V4 Flash':'旧版比赛引擎',planCard=(club,plan)=>`<span><b>${esc(club.name)}</b><small>${plan?`${esc(plan.formation)} · ${esc(plan.mentality)} · ${esc(plan.reason)}`:'真人赛前设置'}</small></span>`,plans=`<div class="report-plans">${planCard(home,result.tacticalPlans?.home)}${planCard(away,result.tacticalPlans?.away)}</div>`;const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card report-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><div class="report-kicker"><span>第 ${round} 轮</span><span class="report-source ${isDeepSeek?'ai':''}">${source}</span></div><h2>${esc(report.headline)}</h2><div class="report-score"><span>${esc(home.name)}</span><b>${result.homeGoals} - ${result.awayGoals}</b><span>${esc(away.name)}</span></div>${plans}<div class="report-tabs"><button class="report-tab active" data-tab="story" onclick="switchReportTab('story')">比赛战报</button><button class="report-tab" data-tab="stats" onclick="switchReportTab('stats')">数据统计</button></div><div class="report-panel" data-panel="story"><p class="report-summary">${esc(report.summary)}</p><div class="report-tactical"><b>战术观察</b><span>${esc(report.tacticalNote||'暂无')}</span></div><div class="report-section"><h3>比赛关键事件</h3><div class="report-events">${events}</div></div><div class="report-section"><div class="report-ratings-title"><div><h3>球员评分</h3><small>双方首发球员评分；替补评分见数据统计</small></div></div><div class="report-ratings"><section><h4>${esc(home.name)}</h4>${reportRatingRows(result,'home')}</section><section><h4>${esc(away.name)}</h4>${reportRatingRows(result,'away')}</section></div></div></div><div class="report-panel hidden" data-panel="stats"><div class="report-section team-data"><div class="stats-team-head"><b>${esc(home.name)}</b><h3>球队数据</h3><b>${esc(away.name)}</b></div>${reportTeamData(result)}</div><div class="report-section"><h3>个人数据</h3>${reportPlayerData(result,'home')}${reportPlayerData(result,'away')}</div></div></div></div>`;m.classList.remove('hidden')}
 
-const normalizedPlayerName=value=>String(value||'').toLocaleLowerCase().replace(/[\s·・.\-]/g,'');
-function filteredDraftPlayers(){const query=normalizedPlayerName(draftSearch);return G.availablePlayers.filter(p=>(draftFilter==='ALL'||p.positions.includes(draftFilter))&&(!query||normalizedPlayerName(p.name).includes(query))).sort((left,right)=>right.rating-left.rating||left.name.localeCompare(right.name,'zh-CN'))}
-function draftPlayerCards(players,ct){if(!players.length)return `<div class="draft-no-results"><b>没有找到符合条件的球员</b><span>请更换位置或姓名关键词。</span></div>`;return players.map(p=>`<div class="player advanced"><div class="player-main" onclick="openPlayer('${p.id}')"><strong>${esc(p.name)}</strong><small>${esc(p.era)} · ${posText(p)}</small><div class="mini-attrs">${averageChips(p)}</div></div><div class="rating">${p.rating}</div>${G.session?.teamId===ct.id?`<button onclick="act('/pick',{teamId:'${ct.id}',playerId:'${p.id}'})">选择</button>`:''}</div>`).join('')}
+const normalizedPlayerName = value => String(value || '').toLocaleLowerCase().replace(/[\s·・.\-]/g, '');
+let cachedDraftSource = null;
+let cachedDraftPlayers = [];
+function filteredDraftPlayers() {
+  if (cachedDraftSource !== G.availablePlayers) {
+    cachedDraftSource = G.availablePlayers;
+    cachedDraftPlayers = [...cachedDraftSource]
+      .sort((left, right) => right.rating - left.rating || left.name.localeCompare(right.name, 'zh-CN'))
+      .map(player => ({player, name: normalizedPlayerName(player.name)}));
+  }
+  const query = normalizedPlayerName(draftSearch);
+  return cachedDraftPlayers.filter(({player, name}) =>
+    (draftFilter === 'ALL' || player.positions.includes(draftFilter)) && (!query || name.includes(query))
+  ).map(entry => entry.player);
+}
+function draftPlayerCards(players,ct){if(!players.length)return `<div class="draft-no-results"><b>没有找到符合条件的球员</b><span>请更换位置或姓名关键词。</span></div>`;return players.map(p=>`<div class="player advanced"><div class="player-main" onclick="openPlayer('${p.id}')"><strong>${esc(p.name)}</strong><small>${esc(p.era)} · ${esc(posText(p))}</small><div class="mini-attrs">${averageChips(p)}</div></div><div class="rating">${p.rating}</div>${ct&&G.session?.teamId===ct.id?`<button ${busy?'disabled':''} onclick="act('/pick',{teamId:'${ct.id}',playerId:'${p.id}'})">选择</button>`:''}</div>`).join('')}
 function updateDraftResults(){const input=$('draftNameSearch');if(input)draftSearch=input.value;const ct=team(G.currentDraftTeam),filtered=filteredDraftPlayers(),count=$('draftResultCount'),list=$('draftPlayerList');if(count)count.textContent=`${filtered.length}/${G.availablePlayers.length}`;if(list)list.innerHTML=draftPlayerCards(filtered,ct)}
 function changeDraftPosition(value){draftFilter=value;updateDraftResults()}
 function clearDraftSearch(){draftSearch='';const input=$('draftNameSearch');if(input){input.value='';input.focus()}updateDraftResults()}
 function draftOrderCard(){const count=G.teams.length,round=Math.floor(G.draft.pick/count),turn=G.draft.pick%count,base=G.draft.order||G.teams.map(team=>team.id),order=G.config.draftMode==='snake'&&round%2===1?[...base].reverse():base;return `<div class="card draft-order-card"><div><b>第 ${round+1} 轮选秀顺序</b><span>${G.config.draftMode==='snake'?'首轮随机，下一轮反向':'每轮使用随机顺序'}</span></div><div class="draft-order-list">${order.map((id,index)=>`<span class="${id===G.currentDraftTeam?'active':index<turn?'done':''}"><i>${index+1}</i>${esc(team(id)?.name||id)}</span>`).join('')}</div></div>`}
 
 const views={
-  lobby(){const host=G.session?.role==='host',actions=G.access?.legacyClaimRequired?`<button onclick="claimLegacyRoom()">绑定旧房间到账号</button>`:(host?`${G.phase==='lobby'?`<button onclick="act('/start-draft')">开始选秀</button>`:''}<button class="danger" onclick="openDeleteGame()">删除房间</button>`:'');const identity=G.session?`当前身份：${esc(team(G.session.teamId)?.name||'房主')}${host?' · 房主':''}`:'旧存档尚未绑定账号';return header(esc(G.name),`房间码 ${G.id} · ${G.teams.filter(t=>t.controller==='human').length} 位真人玩家 · ${identity}`,actions)+`<div class="grid teams">${G.teams.map((t,i)=>`<div class="card team"><span class="pill ${t.controller}">${t.controller==='human'?'真人':'AI'}</span><h3>${i+1}. ${t.name}</h3><div class="muted">${esc(t.manager)}${t.controller==='AI'&&t.managerStyle?` · ${esc(t.managerStyle)}`:''} · ${t.formation}</div><div class="muted">${t.squad.length}/${G.config.squadSize} 人 · ${t.mentality}</div></div>`).join('')}</div>`},
+  lobby(){const host=G.session?.role==='host',actions=G.access?.legacyClaimRequired?`<button onclick="claimLegacyRoom()">绑定旧房间到账号</button>`:(host?`${G.phase==='lobby'?`<button onclick="act('/start-draft')">开始选秀</button>`:''}<button class="danger" onclick="openDeleteGame()">删除房间</button>`:'');const identity=G.session?`当前身份：${esc(team(G.session.teamId)?.name||'房主')}${host?' · 房主':''}`:'旧存档尚未绑定账号';return header(esc(G.name),`房间码 ${esc(G.id)} · ${G.teams.filter(t=>t.controller==='human').length} 位真人玩家 · ${identity}`,actions)+`<div class="grid teams">${G.teams.map((t,i)=>`<div class="card team"><span class="pill ${t.controller}">${t.controller==='human'?'真人':'AI'}</span><h3>${i+1}. ${esc(t.name)}</h3><div class="muted">${esc(t.manager)}${t.controller==='AI'&&t.managerStyle?` · ${esc(t.managerStyle)}`:''} · ${esc(t.formation)}</div><div class="muted">${t.squad.length}/${G.config.squadSize} 人 · ${esc(t.mentality)}</div></div>`).join('')}</div>`},
   draft(){
     if(G.phase==='lobby')return empty('房主开始选秀后，球员市场将在这里开放。');
-    if(G.draft.complete)return header('选秀已完成','20 支球队均已组成 18 人阵容。')+empty('前往“战术与阵容”设置双阶段职责，或直接模拟比赛。');
+    if(G.draft.complete)return header('选秀已完成',`${G.teams.length} 支球队均已组成 ${G.config.squadSize} 人阵容。`)+empty('前往“战术与阵容”设置双阶段职责，或直接模拟比赛。');
     const ct=team(G.currentDraftTeam),filtered=filteredDraftPlayers();
+    if (!ct) return empty('选秀数据正在更新，请稍后重试。');
     const filters=[['ALL','全部'],...Object.entries(G.config.positionLabels)];
-    const filterBar=`<div class="draft-filters"><label><span>位置</span><select id="draftPositionFilter" onchange="changeDraftPosition(this.value)">${filters.map(([v,n])=>`<option value="${v}" ${draftFilter===v?'selected':''}>${n}</option>`).join('')}</select></label><label class="draft-name-filter"><span>球员姓名</span><input id="draftNameSearch" value="${esc(draftSearch)}" placeholder="输入姓名查询" autocomplete="off" oninput="updateDraftResults()"></label><button class="secondary" onclick="clearDraftSearch()">清除姓名</button></div>`;
-    return header('选秀中心',`第 ${Math.floor(G.draft.pick/G.teams.length)+1} 轮 · 总第 ${G.draft.pick+1} 顺位 · 当前：${ct.name}`,filterBar)+draftOrderCard()+`<div class="draft-layout"><div class="card"><h3>可选球员（<span id="draftResultCount">${filtered.length}/${G.availablePlayers.length}</span>）</h3><div id="draftPlayerList" class="players">${draftPlayerCards(filtered,ct)}</div></div><div class="card draft-squad"><h3>${ct.name}</h3><p>${esc(ct.manager)} · ${ct.squad.length}/${G.config.squadSize}</p>${ct.squad.map(id=>{const p=player(id);return `<div class="squad-player" onclick="openPlayer('${p.id}')"><span class="pos">${p.position}</span><b>${esc(p.name)}</b><span class="muted">${posText(p)}</span><span class="rating">${p.rating}</span></div>`}).join('')}</div></div>`;
+    const filterBar=`<div class="draft-filters"><label><span>位置</span><select id="draftPositionFilter" onchange="changeDraftPosition(this.value)">${filters.map(([v,n])=>`<option value="${v}" ${draftFilter===v?'selected':''}>${esc(n)}</option>`).join('')}</select></label><label class="draft-name-filter"><span>球员姓名</span><input id="draftNameSearch" value="${esc(draftSearch)}" placeholder="输入姓名查询" autocomplete="off" oninput="updateDraftResults()"></label><button class="secondary" onclick="clearDraftSearch()">清除姓名</button></div>`;
+    return header('选秀中心',`第 ${Math.floor(G.draft.pick/G.teams.length)+1} 轮 · 总第 ${G.draft.pick+1} 顺位 · 当前：${esc(ct.name)}`,filterBar)+draftOrderCard()+`<div class="draft-layout"><div class="card"><h3>可选球员（<span id="draftResultCount">${filtered.length}/${G.availablePlayers.length}</span>）</h3><div id="draftPlayerList" class="players">${draftPlayerCards(filtered,ct)}</div></div><div class="card draft-squad"><h3>${esc(ct.name)}</h3><p>${esc(ct.manager)} · ${ct.squad.length}/${G.config.squadSize}</p>${ct.squad.map(id=>{const p=player(id);return `<div class="squad-player" onclick="openPlayer('${p.id}')"><span class="pos">${esc(p.position)}</span><b>${esc(p.name)}</b><span class="muted">${esc(posText(p))}</span><span class="rating">${p.rating}</span></div>`}).join('')}</div></div>`;
   },
   squad(){
     if(!G.draft.complete)return empty('完成选秀后即可设置完整阵型和球员职责。');
@@ -74,12 +381,12 @@ const views={
     return header('战术与阵容','状态会影响球员能否进入首发；停赛与伤病球员会被自动排除。')+tacticCard(owned);
   },
   clubs(){
-    const selected=team(clubTeamId)||G.teams[0];clubTeamId=selected.id;
-    const selector=`<select onchange="clubTeamId=this.value;render()">${G.teams.map(t=>`<option value="${t.id}" ${t.id===selected.id?'selected':''}>${t.name} · ${esc(t.manager)}</option>`).join('')}</select>`;
+    const selected=team(clubTeamId)||G.teams[0];if(!selected)return empty('暂无球队');clubTeamId=selected.id;
+    const selector=`<select onchange="clubTeamId=this.value;render()">${G.teams.map(t=>`<option value="${t.id}" ${t.id===selected.id?'selected':''}>${esc(t.name)} · ${esc(t.manager)}</option>`).join('')}</select>`;
     return header('球队情报','查看联赛中任意球队的完整名单、首发阵型和双阶段职责。',selector)+scoutCard(selected);
   },
-  fixtures(){const ready=G.capabilities?.aiMatchEngine,host=G.session?.role==='host',progress=G.simulation?.status==='running'?` · 正在模拟第 ${G.simulation.round} 轮 ${G.simulation.completedMatches||0}/${G.simulation.totalMatches||10} 场`:G.simulation?.status==='error'?` · 上次模拟失败：${esc(G.simulation.error)}`:'',acts=G.phase==='season'&&host?(busy?`<button disabled>DeepSeek 模拟中 ${G.simulation?.completedMatches||0}/${G.simulation?.totalMatches||10}</button>`:ready?`<button onclick="act('/play-round')">AI 模拟下一轮</button><button class="secondary" onclick="confirm('剩余每轮都会调用 DeepSeek，确定继续？')&&act('/play-all')">AI 模拟全部</button>`:'<button disabled>请先配置 DEEPSEEK_API_KEY</button>'):'';const from=Math.max(0,G.currentRound-1),display=G.rounds.slice(from,from+3),engine=ready?`${G.capabilities.matchModel} AI 比赛引擎`:'AI 比赛引擎未配置';return header('赛程赛果',`已完成 ${G.currentRound}/38 轮 · ${engine}${progress}`,acts)+display.map(r=>`<div class="card round"><h3>第 ${r.number} 轮 ${r.played?'· 已结束':''}</h3>${r.games.map(x=>{const z=G.results.find(q=>q.round===r.number&&q.home===x.home);return `<div class="fixture"><span class="home">${team(x.home).name}</span><span class="score">${z?z.homeGoals+' - '+z.awayGoals:'VS'}</span><span class="away">${team(x.away).name}</span>${z?.report?`<button class="report-button" onclick="openMatchReport(${r.number},'${x.home}')">查看战报</button>`:'<span></span>'}</div>`}).join('')}</div>`).join('')},
-  table(){return header('积分榜',`第 ${G.currentRound} 轮后`)+`<table><thead><tr><th>#</th><th>球队</th><th>赛</th><th>胜</th><th>平</th><th>负</th><th>进/失</th><th>净胜</th><th>积分</th></tr></thead><tbody>${G.table.map((r,i)=>`<tr><td class="rank">${i+1}</td><td><b>${r.name}</b></td><td>${r.p}</td><td>${r.w}</td><td>${r.d}</td><td>${r.l}</td><td>${r.gf}/${r.ga}</td><td>${r.gd}</td><td><b>${r.pts}</b></td></tr>`).join('')}</tbody></table>`},
+  fixtures(){const ready=G.capabilities?.aiMatchEngine,host=G.session?.role==='host',progress=G.simulation?.status==='running'?` · 正在模拟第 ${G.simulation.round} 轮 ${G.simulation.completedMatches||0}/${G.simulation.totalMatches||10} 场`:G.simulation?.status==='error'?` · 上次模拟失败：${esc(G.simulation.error)}`:'',acts=G.phase==='season'&&host?(busy?`<button disabled>DeepSeek 模拟中 ${G.simulation?.completedMatches||0}/${G.simulation?.totalMatches||10}</button>`:ready?`<button onclick="act('/play-round')">AI 模拟下一轮</button><button class="secondary" onclick="confirm('剩余每轮都会调用 DeepSeek，确定继续？')&&act('/play-all')">AI 模拟全部</button>`:'<button disabled>请先配置 DEEPSEEK_API_KEY</button>'):'';const from=Math.max(0,G.currentRound-1),display=G.rounds.slice(from,from+3),engine=ready?`${esc(G.capabilities.matchModel)} AI 比赛引擎`:'AI 比赛引擎未配置';return header('赛程赛果',`已完成 ${G.currentRound}/${G.rounds.length} 轮 · ${engine}${progress}`,acts)+display.map(r=>`<div class="card round"><h3>第 ${r.number} 轮 ${r.played?'· 已结束':''}</h3>${r.games.map(x=>{const z=matchResult(r.number,x.home);return `<div class="fixture"><span class="home">${esc(team(x.home)?.name||x.home)}</span><span class="score">${z?z.homeGoals+' - '+z.awayGoals:'VS'}</span><span class="away">${esc(team(x.away)?.name||x.away)}</span>${z?.report?`<button class="report-button" onclick="openMatchReport(${r.number},'${x.home}')">查看战报</button>`:'<span></span>'}</div>`}).join('')}</div>`).join('')},
+  table(){return header('积分榜',`第 ${G.currentRound} 轮后`)+`<table><thead><tr><th>#</th><th>球队</th><th>赛</th><th>胜</th><th>平</th><th>负</th><th>进/失</th><th>净胜</th><th>积分</th></tr></thead><tbody>${G.table.map((r,i)=>`<tr><td class="rank">${i+1}</td><td><b>${esc(r.name)}</b></td><td>${r.p}</td><td>${r.w}</td><td>${r.d}</td><td>${r.l}</td><td>${r.gf}/${r.ga}</td><td>${r.gd}</td><td><b>${r.pts}</b></td></tr>`).join('')}</tbody></table>`},
   stats(){const players=G.seasonPlayerStats||[],teams=G.seasonTeamStats||[];if(!G.results.length)return header('赛季数据','球员、球队与纪律数据')+empty('比赛开始后会在这里累计完整赛季数据。');return header('赛季数据',`已统计 ${G.currentRound} 轮 · 出场、评分、进攻、传球、防守与纪律`)+`<div class="card season-table"><h3>球员数据</h3><div class="report-table-wrap"><table><thead><tr><th>#</th><th>球员</th><th>球队</th><th>状态</th><th>出场</th><th>分钟</th><th>进球</th><th>助攻</th><th>射门</th><th>传球</th><th>成功</th><th>成功率</th><th>关键传球</th><th>失机</th><th>扑救</th><th>黄牌</th><th>红牌</th><th>最佳</th><th>评分</th></tr></thead><tbody>${players.map((row,i)=>{const p=player(row.playerId),club=team(row.teamId);return `<tr onclick="openPlayer('${row.playerId}')"><td>${i+1}</td><td><b>${esc(p?.name||row.playerId)}</b></td><td>${esc(club?.name||'')}</td><td>${statusBadge(row.playerId)}</td><td>${row.appearances} (${row.starts})</td><td>${row.minutes}</td><td><b>${row.goals}</b></td><td>${row.assists}</td><td>${row.shots}</td><td>${row.passes}</td><td>${row.passesCompleted}</td><td>${row.passAccuracy}%</td><td>${row.keyPasses}</td><td>${row.bigChancesMissed}</td><td>${row.saves}</td><td>${row.yellowCards}</td><td>${row.redCards}</td><td>${row.playerOfMatch}</td><td><b>${row.averageRating||'—'}</b></td></tr>`}).join('')}</tbody></table></div></div><div class="card season-table"><h3>球队比赛数据</h3><div class="report-table-wrap"><table><thead><tr><th>球队</th><th>场次</th><th>场均控球</th><th>射门</th><th>射正</th><th>绝佳机会</th><th>角球</th><th>犯规</th><th>传球成功率</th></tr></thead><tbody>${teams.map(row=>`<tr><td><b>${esc(team(row.teamId)?.name||row.teamId)}</b></td><td>${row.matches}</td><td>${row.averagePossession}%</td><td>${row.shots}</td><td>${row.shotsOnTarget}</td><td>${row.bigChances}</td><td>${row.corners}</td><td>${row.fouls}</td><td>${row.averagePassAccuracy}%</td></tr>`).join('')}</tbody></table></div></div>`}
 };
 
@@ -88,31 +395,79 @@ const fixedSlotPoints={GK:[50,8],LB:[14,27],LCB:[35,27],CB:[50,27],RCB:[65,27],R
 function makeCustomSlot(index,x,y){x=Math.round(Math.max(6,Math.min(94,Number(x))));y=index===0?8:Math.round(Math.max(17,Math.min(92,Number(y))));const wide=x<24||x>76,group=index===0?'GK':y<=31?(wide?'FB':'CB'):y<=46?(wide?'FB':'DM'):y<=63?(wide?'W':'CM'):y<=79?(wide?'W':'AM'):(wide?'W':'ST'),side=x<42?'左':x>58?'右':'',label={GK:'门将',FB:`${side}边后卫`,CB:`${side}中后卫`,DM:`${side}后腰`,CM:`${side}中场`,AM:`${side}前腰`,W:`${side}边锋`,ST:`${side}前锋`}[group];return{id:`C${String(index+1).padStart(2,'0')}`,label,group,x,y}}
 function defaultCustomFormation(t){const fixed=G.config.formations[t.formation]||G.config.formations[Object.keys(G.config.formations)[0]];return fixed.map((slot,index)=>{const point=fixedSlotPoints[slot.id]||[12+(index%5)*19,24+Math.floor(index/5)*27];return makeCustomSlot(index,point[0],point[1])})}
 function teamSlots(t,formation=t.formation){return formation===customFormationName()?(t.customFormation||[]):(G.config.formations[formation]||[])}
-function formationPreview(t){const slots=t.formation===customFormationName()?t.customFormation:defaultCustomFormation(t),assignments=new Map((t.assignments||[]).map(item=>[item.slotId,item]));return `<div class="formation-preview">${slots.map((slot,index)=>{const sourceId=t.formation===customFormationName()?slot.id:(G.config.formations[t.formation]?.[index]?.id),p=player(assignments.get(sourceId)?.playerId);return `<span style="left:${slot.x}%;bottom:${slot.y}%" title="${esc(slot.label)} · ${esc(p?.name||'未安排')}"><b>${esc(slot.label)}</b><small>${esc(p?.name||'—')}</small></span>`}).join('')}</div>`}
+function formationPreview(t){const slots=t.formation===customFormationName()?(t.customFormation||[]):defaultCustomFormation(t),assignments=new Map((t.assignments||[]).map(item=>[item.slotId,item]));return `<div class="formation-preview">${slots.map((slot,index)=>{const sourceId=t.formation===customFormationName()?slot.id:(G.config.formations[t.formation]?.[index]?.id),p=player(assignments.get(sourceId)?.playerId);return `<span style="left:${slot.x}%;bottom:${slot.y}%" title="${esc(slot.label)} · ${esc(p?.name||'未安排')}"><b>${esc(slot.label)}</b><small>${esc(p?.name||'—')}</small></span>`}).join('')}</div>`}
 
 function scoutCard(t){
   const formationSlots=teamSlots(t),assignmentBySlot=new Map((t.assignments||[]).map(a=>[a.slotId,a]));
   const starters=new Set(t.starters||[]),average=t.squad.length?Math.round(t.squad.reduce((sum,id)=>sum+(player(id)?.rating||0),0)/t.squad.length):0;
-  const lineup=formationSlots.map(slot=>{const a=assignmentBySlot.get(slot.id),p=player(a?.playerId),familiarity=slotFamiliarity(p,slot);return `<div class="scout-role-row"><div class="slot"><b>${slot.id}</b><span>${slot.label}</span></div>${p?`<button class="scout-player" onclick="openPlayer('${p.id}')"><b>${esc(p.name)} ${statusBadge(p.id)}</b><span>${posText(p)} · ${p.rating} · 熟练度 ${familiarity}</span></button>`:'<span class="muted">尚未安排</span>'}<span>${a?.inRole||'—'}</span><span>${a?.outRole||'—'}</span></div>`}).join('');
-  const roster=t.squad.map(id=>{const p=player(id);if(!p)return'';return `<button class="roster-player" onclick="openPlayer('${p.id}')"><span class="pos">${p.position}</span><span><b>${p.name}</b><small>${posText(p)}</small></span>${statusBadge(id)}<span class="roster-status">${starters.has(id)?'首发':'替补'}</span><strong>${p.rating}</strong></button>`}).join('');
+  const lineup=formationSlots.map(slot=>{const a=assignmentBySlot.get(slot.id),p=player(a?.playerId),familiarity=slotFamiliarity(p,slot);return `<div class="scout-role-row"><div class="slot"><b>${esc(slot.id)}</b><span>${esc(slot.label)}</span></div>${p?`<button class="scout-player" onclick="openPlayer('${p.id}')"><b>${esc(p.name)} ${statusBadge(p.id)}</b><span>${esc(posText(p))} · ${p.rating} · 熟练度 ${familiarity}</span></button>`:'<span class="muted">尚未安排</span>'}<span>${esc(a?.inRole||'—')}</span><span>${esc(a?.outRole||'—')}</span></div>`}).join('');
+  const roster=t.squad.map(id=>{const p=player(id);if(!p)return'';return `<button class="roster-player" onclick="openPlayer('${p.id}')"><span class="pos">${esc(p.position)}</span><span><b>${esc(p.name)}</b><small>${esc(posText(p))}</small></span>${statusBadge(id)}<span class="roster-status">${starters.has(id)?'首发':'替补'}</span><strong>${p.rating}</strong></button>`}).join('');
   return `<div class="card scout-card"><div class="scout-summary"><div><span class="pill ${t.controller}">${t.controller==='human'?'真人':'AI'}</span><h2>${esc(t.name)}</h2><p class="muted">经理：${esc(t.manager)}${t.controller==='AI'&&t.managerStyle?` · 风格：${esc(t.managerStyle)}`:''}</p></div><div class="scout-metrics"><span><small>阵型</small><b>${esc(t.formation)}</b></span><span><small>心态</small><b>${esc(t.mentality)}</b></span><span><small>阵容</small><b>${t.squad.length} 人</b></span><span><small>平均总评</small><b>${average||'—'}</b></span></div></div>${formationSlots.length?formationPreview(t):''}<h3>首发与职责</h3>${lineup?`<div class="scout-role-head"><span>位置</span><span>球员</span><span>有球职责</span><span>无球职责</span></div><div class="scout-role-list">${lineup}</div>`:empty('选秀完成后将显示首发战术。')}<h3 class="roster-title">完整名单</h3><div class="roster-grid">${roster||'<p class="muted">尚未选入球员。</p>'}</div></div>`;
 }
 
 function tacticCard(t){
   const slots=teamSlots(t),formations=[...Object.keys(G.config.formations),customFormationName()];
-  return `<div class="card tactic-card"><div class="tactic-toolbar"><div><h2>${t.name}</h2><span class="muted">11 人首发 · 双阶段职责 · 支持自由站位</span></div><label>阵型<select id="formation-${t.id}">${formations.map(f=>`<option ${t.formation===f?'selected':''}>${f}</option>`).join('')}</select></label><label>比赛心态<select id="mentality-${t.id}">${G.config.mentalities.map(m=>`<option ${t.mentality===m?'selected':''}>${m}</option>`).join('')}</select></label><button class="secondary formation-edit-button" onclick="openFormationEditor('${t.id}')">自由排列</button><button class="secondary" onclick="autoLineupTeam('${t.id}')">按阵型自动排阵</button><button onclick="saveTactic('${t.id}')">保存战术</button></div>${t.formation===customFormationName()?formationPreview(t):''}<div class="role-head"><span>位置</span><span>首发球员</span><span>有球职责</span><span>无球职责</span></div><div class="role-list">${slots.map(slot=>roleRow(t,slot)).join('')}</div><details><summary>查看替补与完整阵容（${t.squad.length} 人）</summary><div class="bench-grid">${t.squad.map(id=>{const p=player(id);return `<button class="bench-player" onclick="openPlayer('${p.id}')"><b>${p.name} ${statusBadge(id)}</b><span>${posText(p)} · ${p.rating}</span></button>`}).join('')}</div></details></div>`;
+  return `<div class="card tactic-card"><div class="tactic-toolbar"><div><h2>${esc(t.name)}</h2><span class="muted">${G.config.starters} 人首发 · 双阶段职责 · 支持自由站位</span></div><label>阵型<select id="formation-${t.id}">${formations.map(f=>`<option ${t.formation===f?'selected':''}>${esc(f)}</option>`).join('')}</select></label><label>比赛心态<select id="mentality-${t.id}">${G.config.mentalities.map(m=>`<option ${t.mentality===m?'selected':''}>${esc(m)}</option>`).join('')}</select></label><button class="secondary formation-edit-button" onclick="openFormationEditor('${t.id}')">自由排列</button><button class="secondary" onclick="autoLineupTeam('${t.id}')">按阵型自动排阵</button><button onclick="saveTactic('${t.id}')">保存战术</button></div>${t.formation===customFormationName()?formationPreview(t):''}<div class="role-head"><span>位置</span><span>首发球员</span><span>有球职责</span><span>无球职责</span></div><div class="role-list">${slots.map(slot=>roleRow(t,slot)).join('')}</div><details><summary>查看替补与完整阵容（${t.squad.length} 人）</summary><div class="bench-grid">${t.squad.map(id=>{const p=player(id);return `<button class="bench-player" onclick="openPlayer('${p.id}')"><b>${esc(p.name)} ${statusBadge(id)}</b><span>${esc(posText(p))} · ${p.rating}</span></button>`}).join('')}</div></details></div>`;
 }
 function roleRow(t,slot){
   const a=t.assignments.find(x=>x.slotId===slot.id)||{},p=player(a.playerId),inRoles=G.config.inRoles[slot.group],outRoles=G.config.outRoles[slot.group];
-  return `<div class="role-row"><div class="slot"><b>${slot.id}</b><span>${slot.label}</span></div><select id="player-${t.id}-${slot.id}">${t.squad.map(id=>{const q=player(id),familiarity=slotFamiliarity(q,slot),status=availability(id);return `<option value="${id}" ${id===a.playerId?'selected':''} ${status.type!=='available'?'disabled':''}>${esc(q.name)} · ${status.label} · ${q.positions.join('/')} · 熟练 ${familiarity} · ${q.rating}</option>`}).join('')}</select><select id="in-${t.id}-${slot.id}">${inRoles.map(r=>`<option ${r===a.inRole?'selected':''}>${r}</option>`).join('')}</select><select id="out-${t.id}-${slot.id}">${outRoles.map(r=>`<option ${r===a.outRole?'selected':''}>${r}</option>`).join('')}</select><button class="info-button" onclick="openPlayer('${p?.id||t.squad[0]}')">属性</button></div>`;
+  return `<div class="role-row"><div class="slot"><b>${esc(slot.id)}</b><span>${esc(slot.label)}</span></div><select id="player-${t.id}-${esc(slot.id)}">${t.squad.map(id=>{const q=player(id),familiarity=slotFamiliarity(q,slot),status=availability(id);return `<option value="${id}" ${id===a.playerId?'selected':''} ${status.type!=='available'?'disabled':''}>${esc(q.name)} · ${status.label} · ${q.positions.join('/')} · 熟练 ${familiarity} · ${q.rating}</option>`}).join('')}</select><select id="in-${t.id}-${esc(slot.id)}">${inRoles.map(r=>`<option ${r===a.inRole?'selected':''}>${esc(r)}</option>`).join('')}</select><select id="out-${t.id}-${esc(slot.id)}">${outRoles.map(r=>`<option ${r===a.outRole?'selected':''}>${esc(r)}</option>`).join('')}</select><button class="info-button" onclick="openPlayer('${p?.id||t.squad[0]}')">属性</button></div>`;
 }
-function openFormationEditor(id){const t=team(id),sourceSlots=teamSlots(t),slots=(t.customFormation?.length?t.customFormation:defaultCustomFormation(t)).map(slot=>({...slot})),playerIds=slots.map((slot,index)=>t.assignments.find(item=>item.slotId===sourceSlots[index]?.id)?.playerId);formationEditor={teamId:id,slots,playerIds,selectedSlotId:null};const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card formation-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>自定义阵型</small><h2>${esc(t.name)}自由排列</h2><p class="muted">拖动场上位置改变阵型；点击一名场上球员，再点击右侧替补即可完成主力与替补互换。</p><div class="formation-editor-layout"><div id="customPitch" class="custom-pitch"><i class="pitch-half"></i><i class="pitch-circle"></i><i class="pitch-box top"></i><i class="pitch-box bottom"></i>${slots.map((slot,index)=>{const p=player(playerIds[index]);return `<button id="formation-node-${slot.id}" class="formation-node group-${slot.group}" style="left:${slot.x}%;bottom:${slot.y}%" onpointerdown="startFormationDrag(event,'${slot.id}')" onclick="selectFormationSlot('${slot.id}')"><b>${esc(slot.label)}</b><span>${esc(p?.name||'待安排')}</span><small>${slot.id}</small></button>`}).join('')}</div><aside><h3>替补与首发互换</h3><p id="formationSelection" class="muted">先点击一名场上球员</p><div id="formationBenchList" class="formation-bench-list"></div><h3 class="formation-guide-title">落点识别</h3><p><b>后场</b> 中后卫 / 边后卫</p><p><b>中场</b> 后腰 / 中场</p><p><b>前场</b> 前腰 / 边锋 / 前锋</p><button class="secondary" onclick="resetFormationEditor()">重置为基础布局</button></aside></div><div class="formation-actions"><button class="secondary" onclick="closeModal()">取消</button><button onclick="saveFormationEditor()">保存自由阵型</button></div></div></div>`;m.classList.remove('hidden');renderFormationBench()}
-function renderFormationBench(){if(!formationEditor)return;const t=team(formationEditor.teamId),selectedIndex=formationEditor.slots.findIndex(slot=>slot.id===formationEditor.selectedSlotId),selectedPlayer=player(formationEditor.playerIds[selectedIndex]),selection=$('formationSelection'),list=$('formationBenchList');document.querySelectorAll('.formation-node').forEach(node=>node.classList.toggle('selected',node.id===`formation-node-${formationEditor.selectedSlotId}`));if(selection)selection.textContent=selectedIndex>=0?`已选：${selectedPlayer?.name||formationEditor.slots[selectedIndex].label}，请选择替补`:'先点击一名场上球员';if(!list)return;const bench=t.squad.filter(id=>!formationEditor.playerIds.includes(id));list.innerHTML=bench.map(id=>{const p=player(id),status=availability(id);return `<button class="formation-bench-player" ${status.type!=='available'?'disabled':''} onclick="swapFormationPlayer('${id}')"><span><b>${esc(p.name)}</b><small>${posText(p)} · ${p.rating}</small></span>${statusBadge(id)}</button>`}).join('')||'<span class="muted">暂无可用替补</span>'}
+function openFormationEditor(id){const t=team(id),sourceSlots=teamSlots(t),slots=(t.customFormation?.length?t.customFormation:defaultCustomFormation(t)).map(slot=>({...slot})),playerIds=slots.map((slot,index)=>t.assignments.find(item=>item.slotId===sourceSlots[index]?.id)?.playerId);formationEditor={teamId:id,slots,playerIds,selectedSlotId:null};const m=$('modal');m.innerHTML=`<div class="modal-backdrop" onclick="closeModal()"><div class="modal-card formation-modal" onclick="event.stopPropagation()"><button class="modal-close" onclick="closeModal()">×</button><small>自定义阵型</small><h2>${esc(t.name)}自由排列</h2><p class="muted">拖动场上位置改变阵型；点击一名场上球员，再点击右侧替补即可完成主力与替补互换。</p><div class="formation-editor-layout"><div id="customPitch" class="custom-pitch"><i class="pitch-half"></i><i class="pitch-circle"></i><i class="pitch-box top"></i><i class="pitch-box bottom"></i>${slots.map((slot,index)=>{const p=player(playerIds[index]);return `<button id="formation-node-${esc(slot.id)}" class="formation-node group-${slot.group}" style="left:${slot.x}%;bottom:${slot.y}%" onpointerdown="startFormationDrag(event,'${esc(slot.id)}')" onclick="selectFormationSlot('${esc(slot.id)}')"><b>${esc(slot.label)}</b><span>${esc(p?.name||'待安排')}</span><small>${esc(slot.id)}</small></button>`}).join('')}</div><aside><h3>替补与首发互换</h3><p id="formationSelection" class="muted">先点击一名场上球员</p><div id="formationBenchList" class="formation-bench-list"></div><h3 class="formation-guide-title">落点识别</h3><p><b>后场</b> 中后卫 / 边后卫</p><p><b>中场</b> 后腰 / 中场</p><p><b>前场</b> 前腰 / 边锋 / 前锋</p><button class="secondary" onclick="resetFormationEditor()">重置为基础布局</button></aside></div><div class="formation-actions"><button class="secondary" onclick="closeModal()">取消</button><button onclick="saveFormationEditor()">保存自由阵型</button></div></div></div>`;m.classList.remove('hidden');renderFormationBench()}
+function renderFormationBench(){if(!formationEditor)return;const t=team(formationEditor.teamId),selectedIndex=formationEditor.slots.findIndex(slot=>slot.id===formationEditor.selectedSlotId),selectedPlayer=player(formationEditor.playerIds[selectedIndex]),selection=$('formationSelection'),list=$('formationBenchList');document.querySelectorAll('.formation-node').forEach(node=>node.classList.toggle('selected',node.id===`formation-node-${formationEditor.selectedSlotId}`));if(selection)selection.textContent=selectedIndex>=0?`已选：${selectedPlayer?.name||formationEditor.slots[selectedIndex].label}，请选择替补`:'先点击一名场上球员';if(!list)return;const bench=t.squad.filter(id=>!formationEditor.playerIds.includes(id));list.innerHTML=bench.map(id=>{const p=player(id),status=availability(id);return `<button class="formation-bench-player" ${status.type!=='available'?'disabled':''} onclick="swapFormationPlayer('${id}')"><span><b>${esc(p.name)}</b><small>${esc(posText(p))} · ${p.rating}</small></span>${statusBadge(id)}</button>`}).join('')||'<span class="muted">暂无可用替补</span>'}
 function selectFormationSlot(id){if(!formationEditor)return;formationEditor.selectedSlotId=id;renderFormationBench()}
 function swapFormationPlayer(playerId){if(!formationEditor?.selectedSlotId)return toast('请先点击一名场上球员');const index=formationEditor.slots.findIndex(slot=>slot.id===formationEditor.selectedSlotId),status=availability(playerId);if(index<0)return;if(status.type!=='available')return toast(status.label+'的球员不能进入首发');const incoming=player(playerId),outgoing=player(formationEditor.playerIds[index]);formationEditor.playerIds[index]=playerId;const node=$('formation-node-'+formationEditor.selectedSlotId);if(node)node.querySelector('span').textContent=incoming?.name||'待安排';formationEditor.selectedSlotId=null;renderFormationBench();toast(`${incoming?.name||'替补'} 替换 ${outgoing?.name||'原首发'}`)}
-function moveFormationNode(event,id){if(!formationEditor)return;const pitch=$('customPitch'),rect=pitch.getBoundingClientRect(),index=formationEditor.slots.findIndex(slot=>slot.id===id);if(index<0)return;const x=(event.clientX-rect.left)/rect.width*100,y=(rect.bottom-event.clientY)/rect.height*100,slot=makeCustomSlot(index,x,y),node=$('formation-node-'+id);formationEditor.slots[index]=slot;node.style.left=slot.x+'%';node.style.bottom=slot.y+'%';node.className=`formation-node group-${slot.group}`;node.querySelector('b').textContent=slot.label}
-function startFormationDrag(event,id){event.preventDefault();const node=event.currentTarget,pointerId=event.pointerId,move=next=>moveFormationNode(next,id),finish=next=>{move(next);node.removeEventListener('pointermove',move);node.removeEventListener('pointerup',finish);node.removeEventListener('pointercancel',finish)};node.setPointerCapture(pointerId);node.addEventListener('pointermove',move);node.addEventListener('pointerup',finish);node.addEventListener('pointercancel',finish)}
-function resetFormationEditor(){if(!formationEditor)return;const t=team(formationEditor.teamId),fallback={...t,formation:Object.keys(G.config.formations)[0]},slots=defaultCustomFormation(fallback);formationEditor.slots=slots;formationEditor.selectedSlotId=null;slots.forEach(slot=>{const node=$('formation-node-'+slot.id);node.style.left=slot.x+'%';node.style.bottom=slot.y+'%';node.className=`formation-node group-${slot.group}`;node.querySelector('b').textContent=slot.label});renderFormationBench()}
+function moveFormationNode(event,id){if(!formationEditor)return;const pitch=$('customPitch');if(!pitch)return;const rect=pitch.getBoundingClientRect(),index=formationEditor.slots.findIndex(slot=>slot.id===id);if(index<0||!rect.width||!rect.height)return;const x=(event.clientX-rect.left)/rect.width*100,y=(rect.bottom-event.clientY)/rect.height*100,slot=makeCustomSlot(index,x,y),node=$('formation-node-'+id);formationEditor.slots[index]=slot;node.style.left=slot.x+'%';node.style.bottom=slot.y+'%';node.className=`formation-node group-${slot.group}${formationEditor.selectedSlotId===id?' selected':''}`;node.querySelector('b').textContent=slot.label}
+function startFormationDrag(event, id) {
+  if (event.isPrimary === false || (event.button !== undefined && event.button !== 0)) return;
+  event.preventDefault();
+  formationDragCleanup?.();
+  const node = event.currentTarget;
+  const pointerId = event.pointerId;
+  const move = next => {
+    if (next.pointerId === pointerId) moveFormationNode(next, id);
+  };
+  const cleanup = () => {
+    node.removeEventListener('pointermove', move);
+    node.removeEventListener('pointerup', finish);
+    node.removeEventListener('pointercancel', cancel);
+    node.removeEventListener('lostpointercapture', cleanup);
+    if (node.hasPointerCapture(pointerId)) node.releasePointerCapture(pointerId);
+    if (formationDragCleanup === cleanup) formationDragCleanup = null;
+  };
+  const finish = next => {
+    if (next.pointerId !== pointerId) return;
+    move(next);
+    cleanup();
+  };
+  const cancel = next => {
+    if (next.pointerId === pointerId) cleanup();
+  };
+  node.setPointerCapture(pointerId);
+  node.addEventListener('pointermove', move);
+  node.addEventListener('pointerup', finish);
+  node.addEventListener('pointercancel', cancel);
+  node.addEventListener('lostpointercapture', cleanup);
+  formationDragCleanup = cleanup;
+}
+function resetFormationEditor() {
+  if (!formationEditor) return;
+  formationDragCleanup?.();
+  const currentTeam = team(formationEditor.teamId);
+  const fallback = {...currentTeam, formation: Object.keys(G.config.formations)[0]};
+  const slots = defaultCustomFormation(fallback);
+  formationEditor.slots = slots;
+  formationEditor.selectedSlotId = null;
+  for (const slot of slots) {
+    const node = $('formation-node-' + slot.id);
+    if (!node) continue;
+    node.style.left = slot.x + '%';
+    node.style.bottom = slot.y + '%';
+    node.className = `formation-node group-${slot.group}`;
+    node.querySelector('b').textContent = slot.label;
+  }
+  renderFormationBench();
+}
 function saveFormationEditor(){if(!formationEditor)return;const t=team(formationEditor.teamId),slots=formationEditor.slots;if(formationEditor.playerIds.some(id=>!id)||new Set(formationEditor.playerIds).size!==G.config.starters)return toast('首发阵容不能缺人或出现重复球员');const unavailable=formationEditor.playerIds.find(id=>availability(id).type!=='available');if(unavailable)return toast(availability(unavailable).label+'的球员不能进入首发');const assignments=slots.map((slot,index)=>{const old=t.assignments.find(item=>item.playerId===formationEditor.playerIds[index])||{},inRoles=G.config.inRoles[slot.group],outRoles=G.config.outRoles[slot.group];return{slotId:slot.id,playerId:formationEditor.playerIds[index],inRole:inRoles.includes(old.inRole)?old.inRole:inRoles[0],outRole:outRoles.includes(old.outRole)?old.outRole:outRoles[0]}}),payload={teamId:t.id,formation:customFormationName(),mentality:t.mentality,customFormation:slots,assignments};closeModal();act('/lineup',payload)}
 function autoLineupTeam(id){const t=team(id),formation=$('formation-'+id).value,customFormation=formation===customFormationName()?(t.customFormation||defaultCustomFormation(t)):undefined;act('/lineup',{teamId:id,auto:true,formation,customFormation,mentality:$('mentality-'+id).value})}
 function saveTactic(id){

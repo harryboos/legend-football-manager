@@ -4,15 +4,17 @@ const {profileForTeam, roleBias} = require('./ai-manager');
 const {availabilityFor, isPlayerAvailable} = require('./season');
 
 function bestRole(player, roles, group, profile, phase) {
-  return roles
-    .map(role => ({role, score: roleScore(player, role, group) + roleBias(profile, role, phase)}))
-    .sort((left, right) => right.score - left.score || left.role.localeCompare(right.role, 'zh-CN'))[0];
+  let best;
+  for (const role of roles) {
+    const score = roleScore(player, role, group) + roleBias(profile, role, phase);
+    if (!best || score > best.score || (score === best.score && role.localeCompare(best.role, 'zh-CN') < 0)) {
+      best = {role, score};
+    }
+  }
+  return best;
 }
 
-function lineupOption(game, player, slot, profile) {
-  const rules = rulesFor(game);
-  const inRole = bestRole(player, rules.inRoles[slot.group], slot.group, profile, 'in');
-  const outRole = bestRole(player, rules.outRoles[slot.group], slot.group, profile, 'out');
+function lineupOption(player, slot, inRole, outRole) {
   const fit = positionFit(player, slot);
   return {
     score: fit * 36 + inRole.score * 0.85 + outRole.score * 0.65 + player.rating / 12,
@@ -21,14 +23,25 @@ function lineupOption(game, player, slot, profile) {
 }
 
 function optimalAssignments(game, team, slots, players) {
+  const rules = rulesFor(game);
   const profile = team.controller === 'AI' ? profileForTeam(team) : null;
+  const playerById = new Map(players.map(player => [player.id, player]));
   let states = Array(1 << slots.length).fill(null);
-  states[0] = {score: 0, assignments: []};
+  states[0] = {score: 0, previous: null};
 
-  for (const playerId of team.squad.filter(playerId => isPlayerAvailable(game, playerId))) {
-    const player = players.find(candidate => candidate.id === playerId);
-    if (!player) continue;
-    const options = slots.map(slot => lineupOption(game, player, slot, profile));
+  for (const playerId of team.squad) {
+    const player = playerById.get(playerId);
+    if (!player || !isPlayerAvailable(game, playerId)) continue;
+    const rolesByGroup = new Map();
+    const options = slots.map(slot => {
+      if (!rolesByGroup.has(slot.group)) {
+        rolesByGroup.set(slot.group, [
+          bestRole(player, rules.inRoles[slot.group], slot.group, profile, 'in'),
+          bestRole(player, rules.outRoles[slot.group], slot.group, profile, 'out')
+        ]);
+      }
+      return lineupOption(player, slot, ...rolesByGroup.get(slot.group));
+    });
     const next = states.slice();
     for (let mask = 0; mask < states.length; mask++) {
       const state = states[mask];
@@ -36,18 +49,22 @@ function optimalAssignments(game, team, slots, players) {
       for (let slotIndex = 0; slotIndex < slots.length; slotIndex++) {
         const bit = 1 << slotIndex;
         if (mask & bit) continue;
-        const candidate = {
-          score: state.score + options[slotIndex].score,
-          assignments: [...state.assignments, options[slotIndex].assignment]
-        };
+        const score = state.score + options[slotIndex].score;
         const nextMask = mask | bit;
-        if (!next[nextMask] || candidate.score > next[nextMask].score) next[nextMask] = candidate;
+        if (!next[nextMask] || score > next[nextMask].score) {
+          // Retain only winning paths; reconstruct the lineup once after all players.
+          next[nextMask] = {score, previous: state, assignment: options[slotIndex].assignment};
+        }
       }
     }
     states = next;
   }
 
-  return states[states.length - 1]?.assignments || [];
+  const assignments = [];
+  for (let state = states[states.length - 1]; state?.assignment; state = state.previous) {
+    assignments.push(state.assignment);
+  }
+  return assignments.reverse();
 }
 
 function autoLineup(game, team, players = PLAYERS) {
@@ -83,6 +100,7 @@ function setLineup(game, team, formation, mentality, assignments, customFormatio
 
   if (!Array.isArray(assignments)
     || assignments.length !== rules.starters
+    || assignments.some(assignment => !assignment || typeof assignment !== 'object')
     || new Set(assignments.map(assignment => assignment.playerId)).size !== rules.starters
     || new Set(assignments.map(assignment => assignment.slotId)).size !== rules.starters) {
     throw new Error(`请为 ${rules.starters} 个位置各选择一名不同球员`);
@@ -112,6 +130,8 @@ function mentalityEffect(mentality) {
 function teamMetrics(game, team) {
   const rules = rulesFor(game);
   if (!team.assignments || team.assignments.length !== rules.starters) autoLineup(game, team, game.players);
+  const playerById = new Map(game.players.map(player => [player.id, player]));
+  const slotById = new Map(formationSlots(game, team.formation, team.customFormation).map(slot => [slot.id, slot]));
   let attack = 0;
   let defense = 0;
   let control = 0;
@@ -121,8 +141,8 @@ function teamMetrics(game, team) {
   let outfield = 0;
 
   for (const assignment of team.assignments) {
-    const player = game.players.find(candidate => candidate.id === assignment.playerId);
-    const slot = formationSlots(game, team.formation, team.customFormation).find(candidate => candidate.id === assignment.slotId);
+    const player = playerById.get(assignment.playerId);
+    const slot = slotById.get(assignment.slotId);
     if (!player || !slot) continue;
     const playerFit = positionFit(player, slot);
     const inPossession = roleScore(player, assignment.inRole, slot.group) * playerFit;

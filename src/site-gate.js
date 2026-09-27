@@ -4,6 +4,8 @@ const SITE_GATE_COOKIE = 'lfm_site_access';
 const SITE_GATE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const FAILURE_WINDOW_MS = 10 * 60 * 1000;
 const MAX_FAILURES = 5;
+const MAX_FAILURE_RECORDS = 10_000;
+const CLEANUP_INTERVAL_MS = 60_000;
 
 function digest(value) {
   return crypto.createHash('sha256').update(String(value || '')).digest();
@@ -23,13 +25,27 @@ function createSiteGate(accessKeyValue) {
     ? crypto.createHmac('sha256', accessKey).update('legend-football-manager-site-gate-v1').digest('base64url')
     : '';
   const failures = new Map();
+  let nextCleanupAt = 0;
+
+  function cleanExpired(now) {
+    if (now < nextCleanupAt) return;
+    for (const [key, record] of failures) {
+      if (record.blockedUntil <= now && now - record.windowStartedAt >= FAILURE_WINDOW_MS) failures.delete(key);
+    }
+    nextCleanupAt = now + CLEANUP_INTERVAL_MS;
+  }
 
   function retryAfterSeconds(identifier) {
+    const now = Date.now();
+    cleanExpired(now);
     const key = String(identifier || 'unknown');
     const record = failures.get(key);
-    if (!record) return 0;
-    if (record.blockedUntil > Date.now()) return Math.ceil((record.blockedUntil - Date.now()) / 1000);
-    if (Date.now() - record.windowStartedAt >= FAILURE_WINDOW_MS) failures.delete(key);
+    if (!record) {
+      // Bound memory without evicting blocked clients and resetting their failure counts.
+      return failures.size >= MAX_FAILURE_RECORDS ? Math.max(1, Math.ceil((nextCleanupAt - now) / 1000)) : 0;
+    }
+    if (record.blockedUntil > now) return Math.ceil((record.blockedUntil - now) / 1000);
+    if (now - record.windowStartedAt >= FAILURE_WINDOW_MS) failures.delete(key);
     return 0;
   }
 

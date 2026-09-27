@@ -899,7 +899,8 @@ test('朋友访问密钥在最外层拦截账号与房间接口', async () => {
     save: () => {},
     publicDirectory: path.join(__dirname, '..', 'public'),
     auth,
-    siteGate
+    siteGate,
+    trustProxy: true
   });
 
   const status = await callHandler(handler, 'GET', '/api/gate/status');

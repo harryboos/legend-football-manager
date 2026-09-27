@@ -1,8 +1,77 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>harryboos的个人项目</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/tactics.css"><link rel="stylesheet" href="/onboarding.css"><link rel="stylesheet" href="/draft.css"><link rel="stylesheet" href="/player-profile.css"></head>
-<body><header><div><b>⚽ harryboos的个人项目</b><span>20 队 · 双阶段职责 · 38 轮联赛</span></div><div class="header-account"><div id="roomBadge"></div><div id="accountBadge" class="hidden"></div></div></header>
-<main>
- <section id="gate" class="hero auth-hero"><div><small>仅限朋友访问</small><h1>欢迎来到，<br>我们的足球世界。</h1><p>这是一个私人足球项目。请输入朋友访问密钥，验证后才能继续登录账号。</p></div><div class="card form auth-form"><h2>验证访问密钥</h2><label>朋友访问密钥<input id="siteAccessKey" type="password" minlength="8" maxlength="128" autocomplete="off" placeholder="请输入朋友分享给你的密钥" onkeydown="event.key==='Enter'&&unlockSite()"></label><button id="siteUnlockButton" onclick="unlockSite()">进入网站</button><p id="gateMessage" class="muted auth-tip">验证成功后，当前浏览器将在 30 天内保持访问权限。</p></div></section>
- <section id="login" class="hero auth-hero hidden"><div><small>账号登录</small><h1>先登录，<br>再执掌你的球队。</h1><p>球队权限会绑定到账号。同一账号可以在手机、电脑或其他浏览器登录，并继续管理同一支球队。</p></div><div class="card form auth-form"><h2>登录账号</h2><label>用户名<input id="loginUsername" minlength="3" maxlength="24" autocomplete="username" placeholder="3 至 24 个字符"></label><label>密码<input id="loginPassword" type="password" minlength="6" maxlength="72" autocomplete="current-password" placeholder="6 至 72 个字符" onkeydown="event.key==='Enter'&&loginAccount()"></label><button onclick="loginAccount()">登录</button><div class="or">第一次来？</div><button class="secondary" onclick="registerAccount()">注册并登录</button><p class="muted auth-tip">登录后，创建房间和加入房间都不需要额外密码或密钥。</p></div></section>
- <section id="welcome" class="hero hidden"><div><small>harryboos的个人项目</small><h1>组建你的传奇之师，<br>赢下整个赛季。</h1><p>邀请伙伴加入同一房间，其余球队交给 AI。选择球队、完成选秀、排兵布阵，然后见证 38 轮冠军之路。</p></div><div class="card form"><h2>开始联赛</h2><label>联赛名称<input id="leagueName" value="周末传奇联赛"></label><label>你的经理名<input id="managerName" value="主教练"></label><label>你的开局球队<select id="hostTeam"></select></label><button onclick="createGame()">创建新房间</button><div class="or">或加入已有房间</div><label>房间码<input id="roomCode" maxlength="6" placeholder="例如 ABC123"></label><button class="secondary" onclick="joinGame()">查看可选球队</button></div></section>
- <section id="app" class="hidden"><nav id="tabs"></nav><div id="view"></div></section>
-</main><div id="modal" class="hidden"></div><div id="toast"></div><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>harryboos的个人项目</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/tactics.css">
+  <link rel="stylesheet" href="/onboarding.css">
+  <link rel="stylesheet" href="/draft.css">
+  <link rel="stylesheet" href="/player-profile.css">
+</head>
+<body>
+  <header>
+    <div><b>⚽ harryboos的个人项目</b><span>20 队 · 双阶段职责 · 38 轮联赛</span></div>
+    <div class="header-account">
+      <div id="roomBadge"></div>
+      <div id="accountBadge" class="hidden"></div>
+    </div>
+  </header>
+  <main>
+    <section id="gate" class="hero auth-hero">
+      <div>
+        <small>仅限朋友访问</small>
+        <h1>欢迎来到，<br>我们的足球世界。</h1>
+        <p>这是一个私人足球项目。请输入朋友访问密钥，验证后才能继续登录账号。</p>
+      </div>
+      <div class="card form auth-form">
+        <h2>验证访问密钥</h2>
+        <label>朋友访问密钥<input id="siteAccessKey" type="password" minlength="8" maxlength="128" autocomplete="off" placeholder="请输入朋友分享给你的密钥" onkeydown="event.key==='Enter'&&unlockSite()"></label>
+        <button id="siteUnlockButton" onclick="unlockSite()">进入网站</button>
+        <p id="gateMessage" class="muted auth-tip" role="status">验证成功后，当前浏览器将在 30 天内保持访问权限。</p>
+      </div>
+    </section>
+    <section id="login" class="hero auth-hero hidden">
+      <div>
+        <small>账号登录</small>
+        <h1>先登录，<br>再执掌你的球队。</h1>
+        <p>球队权限会绑定到账号。同一账号可以在手机、电脑或其他浏览器登录，并继续管理同一支球队。</p>
+      </div>
+      <div class="card form auth-form">
+        <h2>登录账号</h2>
+        <label>用户名<input id="loginUsername" minlength="3" maxlength="24" autocomplete="username" placeholder="3 至 24 个字符"></label>
+        <label>密码<input id="loginPassword" type="password" minlength="6" maxlength="72" autocomplete="current-password" placeholder="6 至 72 个字符" onkeydown="event.key==='Enter'&&loginAccount()"></label>
+        <button onclick="loginAccount()">登录</button>
+        <div class="or">第一次来？</div>
+        <button class="secondary" onclick="registerAccount()">注册并登录</button>
+        <p class="muted auth-tip">登录后，创建房间和加入房间都不需要额外密码或密钥。</p>
+      </div>
+    </section>
+    <section id="welcome" class="hero hidden">
+      <div>
+        <small>harryboos的个人项目</small>
+        <h1>组建你的传奇之师，<br>赢下整个赛季。</h1>
+        <p>邀请伙伴加入同一房间，其余球队交给 AI。选择球队、完成选秀、排兵布阵，然后见证 38 轮冠军之路。</p>
+      </div>
+      <div class="card form">
+        <h2>开始联赛</h2>
+        <label>联赛名称<input id="leagueName" value="周末传奇联赛"></label>
+        <label>你的经理名<input id="managerName" value="主教练"></label>
+        <label>你的开局球队<select id="hostTeam"></select></label>
+        <button onclick="createGame()">创建新房间</button>
+        <div class="or">或加入已有房间</div>
+        <label>房间码<input id="roomCode" maxlength="6" placeholder="例如 ABC123" autocomplete="off" autocapitalize="characters" spellcheck="false" onkeydown="event.key==='Enter'&&joinGame()"></label>
+        <button class="secondary" onclick="joinGame()">查看可选球队</button>
+      </div>
+    </section>
+    <section id="app" class="hidden">
+      <nav id="tabs" aria-label="联赛导航"></nav>
+      <div id="view"></div>
+    </section>
+  </main>
+  <div id="modal" class="hidden" role="dialog" aria-modal="true" aria-label="详情"></div>
+  <div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

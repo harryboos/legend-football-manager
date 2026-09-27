@@ -15,7 +15,8 @@ function createApplication(options = {}) {
   const matchService = options.matchService || createDeepSeekMatchService();
   const auth = options.auth || createAuthService({file: options.authFile || path.join(__dirname, 'data', 'auth.json')});
   const siteGate = options.siteGate || createSiteGate(options.siteAccessKey === undefined ? cfg.SITE_ACCESS_KEY : options.siteAccessKey);
-  const handler = createRequestHandler({games, save: current => store.save(current), publicDirectory, matchService, auth, siteGate});
+  const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === 'true';
+  const handler = createRequestHandler({games, save: current => store.save(current), publicDirectory, matchService, auth, siteGate, trustProxy});
   return {server: http.createServer(handler), handler, games, store, matchService, auth, siteGate};
 }
 

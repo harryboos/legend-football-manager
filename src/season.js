@@ -5,25 +5,36 @@ function defaultStatus() {
   return {yellowCards: 0, suspensionMatches: 0, injuryMatches: 0, injury: null};
 }
 
-function ensurePlayerStatuses(game) {
-  game.playerStatuses = game.playerStatuses && typeof game.playerStatuses === 'object' ? game.playerStatuses : {};
-  for (const player of game.players || []) {
-    const source = game.playerStatuses[player.id] || {};
-    const status = {
-      yellowCards: Math.max(0, Math.round(Number(source.yellowCards) || 0)),
-      suspensionMatches: Math.max(0, Math.round(Number(source.suspensionMatches) || 0)),
-      injuryMatches: Math.max(0, Math.round(Number(source.injuryMatches) || 0)),
-      injury: source.injury ? String(source.injury).slice(0, 40) : null
-    };
-    if (!status.injuryMatches) status.injury = null;
-    game.playerStatuses[player.id] = status;
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.round(number)) : 0;
+}
+
+function statusMap(game) {
+  if (!game.playerStatuses || typeof game.playerStatuses !== 'object' || Array.isArray(game.playerStatuses)) {
+    game.playerStatuses = {};
   }
   return game.playerStatuses;
 }
 
+function ensurePlayerStatuses(game) {
+  for (const player of game.players || []) statusFor(game, player.id);
+  return statusMap(game);
+}
+
 function statusFor(game, playerId) {
-  ensurePlayerStatuses(game);
-  return game.playerStatuses[playerId] || (game.playerStatuses[playerId] = defaultStatus());
+  const statuses = statusMap(game);
+  let status = Object.hasOwn(statuses, playerId) ? statuses[playerId] : null;
+  if (!status || typeof status !== 'object' || Array.isArray(status)) {
+    status = defaultStatus();
+    Object.defineProperty(statuses, playerId, {value: status, writable: true, enumerable: true, configurable: true});
+  }
+  // Normalize only the requested player and retain references held by round settlement.
+  status.yellowCards = nonNegativeInteger(status.yellowCards);
+  status.suspensionMatches = nonNegativeInteger(status.suspensionMatches);
+  status.injuryMatches = nonNegativeInteger(status.injuryMatches);
+  status.injury = status.injuryMatches && status.injury ? String(status.injury).slice(0, 40) : null;
+  return status;
 }
 
 function availabilityFor(game, playerId) {
@@ -54,8 +65,7 @@ function injuryDetails(matches) {
 }
 
 function generatedInjuryEvents(game, result) {
-  const existing = (result.report.events || []).filter(event => event.type === 'injury');
-  if (existing.length) return existing;
+  if ((result.report.events || []).some(event => event.type === 'injury')) return [];
   const participants = (result.report.playerStats || []).filter(item => item.minutes >= 20);
   if (!participants.length) return [];
   const base = `${game.seed}:${result.round}:${result.home}:${result.away}:injury`;
@@ -95,6 +105,13 @@ function applyInjuryMinutes(result) {
   }
 }
 
+function applyDiscipline(status, item) {
+  const yellowCards = status.yellowCards + nonNegativeInteger(item.yellowCards);
+  status.yellowCards = yellowCards % YELLOW_CARD_THRESHOLD;
+  status.suspensionMatches += Math.floor(yellowCards / YELLOW_CARD_THRESHOLD)
+    + nonNegativeInteger(item.redCards) * RED_CARD_SUSPENSION;
+}
+
 function settleRoundStatuses(game, results, unavailableBeforeRound) {
   ensurePlayerStatuses(game);
   for (const [playerId, previous] of Object.entries(unavailableBeforeRound || {})) {
@@ -106,16 +123,11 @@ function settleRoundStatuses(game, results, unavailableBeforeRound) {
 
   for (const result of results) {
     const generated = generatedInjuryEvents(game, result);
-    if (generated.length) result.report.events = [...result.report.events, ...generated].sort((left, right) => left.minute - right.minute);
+    if (generated.length) result.report.events = [...(result.report.events || []), ...generated].sort((left, right) => left.minute - right.minute);
     applyInjuryMinutes(result);
     for (const item of result.report.playerStats || []) {
       const status = statusFor(game, item.playerId);
-      status.yellowCards += Math.max(0, Number(item.yellowCards) || 0);
-      while (status.yellowCards >= YELLOW_CARD_THRESHOLD) {
-        status.yellowCards -= YELLOW_CARD_THRESHOLD;
-        status.suspensionMatches++;
-      }
-      status.suspensionMatches += Math.max(0, Number(item.redCards) || 0) * RED_CARD_SUSPENSION;
+      applyDiscipline(status, item);
     }
     for (const event of result.report.events || []) {
       if (event.type !== 'injury') continue;
@@ -154,12 +166,7 @@ function rebuildPlayerStatuses(game) {
     for (const result of results) {
       for (const item of result.report?.playerStats || []) {
         const status = statusFor(game, item.playerId);
-        status.yellowCards += Math.max(0, Number(item.yellowCards) || 0);
-        while (status.yellowCards >= YELLOW_CARD_THRESHOLD) {
-          status.yellowCards -= YELLOW_CARD_THRESHOLD;
-          status.suspensionMatches++;
-        }
-        status.suspensionMatches += Math.max(0, Number(item.redCards) || 0) * RED_CARD_SUSPENSION;
+        applyDiscipline(status, item);
       }
       for (const event of result.report?.events || []) {
         if (event.type !== 'injury' || !event.playerId) continue;

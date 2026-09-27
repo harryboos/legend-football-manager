@@ -504,15 +504,19 @@ async function playRound(game, matchService) {
   round.played = true;
   game.currentRound++;
   if (game.currentRound >= game.rounds.length) game.phase = 'finished';
-  if (game.aiSimulationCache) delete game.aiSimulationCache[String(round.number)];
+  if (game.aiSimulationCache) {
+    delete game.aiSimulationCache[String(round.number)];
+    if (game.aiSimulationCache.signatures) delete game.aiSimulationCache.signatures[String(round.number)];
+  }
   return results;
 }
 
 function leagueTable(game) {
   const rows = game.teams.map(team => ({teamId: team.id, name: team.name, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, gd: 0, pts: 0}));
+  const byTeam = new Map(rows.map(row => [row.teamId, row]));
   for (const result of game.results) {
-    const home = rows.find(row => row.teamId === result.home);
-    const away = rows.find(row => row.teamId === result.away);
+    const home = byTeam.get(result.home);
+    const away = byTeam.get(result.away);
     if (!home || !away) continue;
     home.p++;
     away.p++;

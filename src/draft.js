@@ -1,6 +1,6 @@
 const {rulesFor} = require('./rules');
 const {autoLineup} = require('./lineup');
-const {candidateDraftScore} = require('./ai-manager');
+const {candidateDraftScore, createDraftContext} = require('./ai-manager');
 
 function randomDraftOrder(teamIds, seed) {
   let state = (Number(seed) >>> 0) || 1;
@@ -34,11 +34,20 @@ function currentDraftTeam(game) {
 }
 
 function aiChoice(game, team) {
-  return availablePlayers(game)
-    .map(player => ({player, score: candidateDraftScore(game, team, player)}))
-    .sort((left, right) => right.score - left.score
-      || right.player.rating - left.player.rating
-      || left.player.name.localeCompare(right.player.name, 'zh-CN'))[0]?.player;
+  // Squad needs and positional coverage are shared by every candidate in this pick.
+  const context = createDraftContext(game, team);
+  let best;
+  let bestScore = -Infinity;
+  for (const player of availablePlayers(game)) {
+    const score = candidateDraftScore(game, team, player, context);
+    if (!best || score > bestScore
+      || (score === bestScore && (player.rating > best.rating
+        || (player.rating === best.rating && player.name.localeCompare(best.name, 'zh-CN') < 0)))) {
+      best = player;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 function draftPick(game, teamId, playerId) {

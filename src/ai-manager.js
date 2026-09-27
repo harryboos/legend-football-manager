@@ -182,33 +182,40 @@ function tacticalAttributeScore(player, profile) {
   return keys.reduce((sum, key) => sum + (player.attributes[key] || 1), 0) / Math.max(1, keys.length) * 5;
 }
 
-function candidateDraftScore(game, team, player) {
+function createDraftContext(game, team) {
   const rules = rulesFor(game);
   const profile = profileForTeam(team);
   const plan = squadPlanFor(game, team);
+  const playerById = new Map(game.players.map(player => [player.id, player]));
+  const selectedPlayers = team.squad.map(id => playerById.get(id)).filter(Boolean);
   const counts = Object.fromEntries(GROUPS.map(group => [group, 0]));
-  for (const playerId of team.squad) {
-    const selected = game.players.find(candidate => candidate.id === playerId);
-    if (selected) counts[groupForPosition(selected.position)]++;
+  const positionCounts = new Map();
+  for (const selected of selectedPlayers) {
+    counts[groupForPosition(selected.position)]++;
+    positionCounts.set(selected.position, (positionCounts.get(selected.position) || 0) + 1);
   }
+  const slots = formationSlots(game, team.formation, team.customFormation);
+  return {
+    profile, plan, counts, positionCounts, slots,
+    progress: team.squad.length / Math.max(1, rules.squadSize - 1),
+    currentFits: slots.map(slot => Math.max(...selectedPlayers.map(selected => positionFit(selected, slot)), 0.25))
+  };
+}
 
+function candidateDraftScore(game, team, player, context = createDraftContext(game, team)) {
+  const {profile, plan, counts, positionCounts, slots, progress, currentFits} = context;
   const group = groupForPosition(player.position);
   const target = plan[group] || 0;
   const deficit = target - counts[group];
-  const progress = team.squad.length / Math.max(1, rules.squadSize - 1);
   const needScore = deficit > 0
     ? (8 + progress * 32) * Math.min(1.4, deficit / Math.max(1, target) + 0.55)
     : -(10 + progress * 42) * (1 + Math.max(0, counts[group] - target) * 0.3);
 
-  const slots = formationSlots(game, team.formation, team.customFormation);
-  const formationFit = Math.max(...slots.map(slot => positionFit(player, slot)), 0.25) * 100;
-  const selectedPlayers = team.squad.map(id => game.players.find(candidate => candidate.id === id)).filter(Boolean);
-  const uncoveredImprovement = Math.max(...slots.map(slot => {
-    const currentFit = Math.max(...selectedPlayers.map(selected => positionFit(selected, slot)), 0.25);
-    return Math.max(0, positionFit(player, slot) - currentFit);
-  }), 0) * 18;
+  const fits = slots.map(slot => positionFit(player, slot));
+  const formationFit = Math.max(...fits, 0.25) * 100;
+  const uncoveredImprovement = Math.max(...fits.map((fit, index) => Math.max(0, fit - currentFits[index])), 0) * 18;
   const versatility = Object.values(player.positionFamiliarity || {}).filter(value => value >= 72).length;
-  const samePosition = selectedPlayers.filter(selected => selected.position === player.position).length;
+  const samePosition = positionCounts.get(player.position) || 0;
 
   return player.rating * 0.56
     + tacticalAttributeScore(player, profile) * 0.2
@@ -228,6 +235,7 @@ function roleBias(profile, role, phase) {
 module.exports = {
   AI_MANAGER_PROFILES,
   candidateDraftScore,
+  createDraftContext,
   formationForProfile,
   matchPlanFor,
   profileForIndex,
